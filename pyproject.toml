@@ -1,6 +1,6 @@
 [project]
 name = "printer-ai-skills"
-version = "1.0.0"
+version = "1.1.0"
 description = "跨平台本地打印机 CLI - 让 AI 驱动本地打印"
 readme = "README.md"
 requires-python = ">=3.10"
