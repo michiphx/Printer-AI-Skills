@@ -131,9 +131,86 @@ printer-ai cancel-job JOB_ID
 | `dmDuplex` | `1`=simplex, `2`=long-edge, `3`=short-edge | Duplex (双面打印) |
 | `dmPrintQuality` | `-4`=default | Quality (质量) |
 
+## Network Discovery & Setup
+
+The spooler reports a *cached* state: a printer that is switched off, or stranded
+on an old subnet, still shows up as `idle`. These commands go to the wire instead.
+
+### `diagnose` — which printers are really online ⭐
+
+```bash
+printer-ai diagnose            # human-readable
+printer-ai diagnose --json     # for parsing
+printer-ai diagnose --fast     # skip the IPP identity query
+```
+
+Resolves each queue's host, probes it, and reports `really_online` plus the live
+device state. **Use this instead of `status` when the question is "is it actually
+reachable".**
+
+### `discover` — find printers on the LAN
+
+```bash
+printer-ai discover                      # scan the local /24
+printer-ai discover --subnet 192.168.1   # a specific /24
+printer-ai discover --json
+```
+
+Probes ports 9100/631/515, then asks each hit over IPP for its model, state and
+real capabilities (duplex, media, colour modes). Adds the MAC from the ARP cache.
+
+### `probe HOST` — inspect one address
+
+```bash
+printer-ai probe 192.168.1.72
+```
+
+Returns open ports and the device's own IPP identity. Note: many printers (Epson
+among them) accept TCP on 631 but **reset anything that is not TLS** — the query
+tries plain IPP, then IPPS, then 443.
+
+### `setup HOST` — install with the best available driver ⭐
+
+```bash
+printer-ai setup 192.168.1.72 --dry-run          # show the plan, change nothing
+printer-ai setup 192.168.1.72 --name "Buero"     # install
+printer-ai setup 192.168.1.72 --no-generic       # fail rather than degrade
+```
+
+Identifies the device over IPP, then walks a strategy ladder from best to worst:
+
+1. **Vendor driver** — installed, or pulled from the in-box Windows INF store
+2. **IPP Everywhere** — Microsoft IPP Class Driver on a real IPP port, which
+   negotiates duplex/media/colour live from the device *(needs admin)*
+3. **Raw 9100 fallback** — always prints, but exposes only generic capabilities
+
+Afterwards it **verifies the installed queue against the device's own advertised
+capabilities** and reports what was lost:
+
+```json
+"missing": ["duplex (device supports two-sided printing)",
+            "media types (0 exposed, 9 on device)"],
+"full_featured": false
+```
+
+`--no-generic` refuses step 3 entirely — better no printer than a crippled one.
+
+⚠️ Steps 1 and 2 need an **elevated shell**. Without admin only the raw fallback
+succeeds; the output says so in `note`/`hint` rather than failing silently.
+
+### Inventory & management
+
+```bash
+printer-ai ports                              # spooler ports
+printer-ai drivers --model "EPSON ET-4850"    # ranked driver candidates
+printer-ai set-default "Printer Name"
+printer-ai remove "Printer Name" --yes        # --yes is required
+```
+
 ## Notes
 
 - Check printer status with `printer-ai status` before printing to confirm it is online
+- `status` reflects the spooler cache — use `diagnose` to confirm real reachability
 - Print option formats differ by platform: macOS/Linux uses CUPS/IPP string format, Windows uses DEVMODE integer format
 - Use `printer-ai attrs` to discover actual supported options for a specific printer
 - The `--json` flag returns pure JSON output for easy programmatic parsing

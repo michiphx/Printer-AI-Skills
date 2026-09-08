@@ -221,6 +221,133 @@ def cmd_cancel_job(args):
         print("✅ 打印任务已取消")
 
 
+# ==================== 网络发现 / 安装命令 ====================
+
+
+def _fail(result):
+    """Print the error of a failed APIResponse and exit."""
+    print(f"❌ {result.get('msg', 'failed')}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_discover(args):
+    """扫描局域网中的打印机 - scan the LAN for printers"""
+    from local_printer import commands_net
+
+    result = commands_net.discover(subnet=args.subnet, timeout=args.timeout, deep=not args.fast)
+    if args.json:
+        output_json(result)
+        return
+    if result.get("code") != 200:
+        _fail(result)
+
+    data = result["data"]
+    printers = data["printers"]
+    print(f"扫描 {data['subnet']} - 找到 {data['count']} 台打印机\n")
+    for entry in printers:
+        ipp = entry.get("ipp") or {}
+        model = ipp.get("make_and_model") or entry.get("vendor_hint") or "unbekanntes Modell"
+        state = ipp.get("state")
+        icon = {"idle": "🟢", "processing": "🟡", "stopped": "🔴"}.get(state, "⚪")
+        print(f"  {entry['host']}  {icon} {model}")
+        print(f"      Ports: {', '.join(entry['open_ports'])}")
+        if entry.get("mac"):
+            print(f"      MAC:   {entry['mac']}")
+        if ipp.get("supports_duplex") is not None:
+            duplex = "ja" if ipp["supports_duplex"] else "nein"
+            print(f"      Duplex: {duplex}  |  Standardmedium: {ipp.get('media_default', '?')}")
+    if not printers:
+        print("  (keine gefunden - ggf. --subnet angeben)")
+
+
+def cmd_probe(args):
+    """探测单个主机 - probe one host"""
+    from local_printer import commands_net
+
+    result = commands_net.probe(args.host, timeout=args.timeout)
+    output_json(result)
+
+
+def cmd_diagnose(args):
+    """核对已安装打印机是否真的在线 - verify installed printers against the network"""
+    from local_printer import commands_net
+
+    result = commands_net.diagnose(deep=not args.fast, timeout=args.timeout)
+    if args.json:
+        output_json(result)
+        return
+    if result.get("code") != 200:
+        _fail(result)
+
+    data = result["data"]
+    print(f"{data['count']} 台打印机: {data['online']} 在线, {data['offline']} 离线\n")
+    for entry in data["printers"]:
+        icon = "🟢" if entry["really_online"] else "🔴"
+        default = " ⭐" if entry.get("is_default") else ""
+        print(f"  [{entry['index']}] {entry['name']}{default}")
+        print(f"      Spooler: {entry['spooler_status']}  |  {icon} {entry['verdict']}")
+        if entry.get("model"):
+            print(f"      Geraet:  {entry['model']} ({entry.get('device_state', '?')})")
+
+
+def cmd_ports(args):
+    from local_printer import commands_net
+
+    output_json(commands_net.ports())
+
+
+def cmd_drivers(args):
+    from local_printer import commands_net
+
+    output_json(commands_net.drivers(model=args.model))
+
+
+def cmd_setup(args):
+    """安装网络打印机（优先完整驱动） - install a network printer, best driver first"""
+    from local_printer import commands_net
+
+    result = commands_net.setup(
+        args.host, name=args.name, dry_run=args.dry_run, allow_generic=not args.no_generic
+    )
+    if args.json or args.dry_run:
+        output_json(result)
+        return
+    if result.get("code") != 200:
+        output_json(result)
+        _fail(result)
+
+    data = result["data"]
+    strategy = data.get("installed_with") or {}
+    print(f"✅ Drucker eingerichtet: {data.get('printer')}")
+    print(f"   Methode: {strategy.get('kind')}  |  Treiber: {strategy.get('driver')}")
+    print(f"   Port:    {strategy.get('port')}")
+
+    verification = data.get("verification") or {}
+    if verification.get("full_featured"):
+        print("   ✅ Alle Geraetefunktionen verfuegbar")
+    else:
+        print("   ⚠️  Eingeschraenkte Funktionen:")
+        for item in verification.get("missing", []):
+            print(f"      - {item}")
+    if data.get("hint"):
+        print(f"   💡 {data['hint']}")
+
+
+def cmd_remove(args):
+    from local_printer import commands_net
+
+    if not args.yes:
+        print("❌ Refusing to remove a printer without --yes", file=sys.stderr)
+        sys.exit(1)
+    output_json(commands_net.remove(args.name))
+
+
+def cmd_set_default(args):
+    from local_printer import commands_net
+
+    output_json(commands_net.set_default(args.name))
+
+
 # ==================== 主入口 ====================
 
 
@@ -272,6 +399,57 @@ def main():
     p_cj = subparsers.add_parser("cancel-job", help="取消打印任务")
     p_cj.add_argument("job_id", type=int, help="任务 ID")
     p_cj.set_defaults(func=cmd_cancel_job)
+
+    # discover
+    p_disc = subparsers.add_parser("discover", help="扫描局域网中的打印机")
+    p_disc.add_argument("--subnet", default=None, help="要扫描的 /24 网段，如 192.168.1")
+    p_disc.add_argument("--timeout", type=float, default=0.6, help="每个端口的超时秒数")
+    p_disc.add_argument("--fast", action="store_true", help="跳过 IPP 身份查询")
+    p_disc.add_argument("--json", action="store_true", help="JSON 格式输出")
+    p_disc.set_defaults(func=cmd_discover)
+
+    # probe
+    p_probe = subparsers.add_parser("probe", help="探测单个主机是否为打印机")
+    p_probe.add_argument("host", help="IP 地址")
+    p_probe.add_argument("--timeout", type=float, default=1.0, help="超时秒数")
+    p_probe.set_defaults(func=cmd_probe)
+
+    # diagnose
+    p_diag = subparsers.add_parser("diagnose", help="核对已安装打印机是否真的在线")
+    p_diag.add_argument("--timeout", type=float, default=1.0, help="超时秒数")
+    p_diag.add_argument("--fast", action="store_true", help="跳过 IPP 身份查询")
+    p_diag.add_argument("--json", action="store_true", help="JSON 格式输出")
+    p_diag.set_defaults(func=cmd_diagnose)
+
+    # ports
+    p_ports = subparsers.add_parser("ports", help="列出打印机端口")
+    p_ports.set_defaults(func=cmd_ports)
+
+    # drivers
+    p_drv = subparsers.add_parser("drivers", help="列出打印机驱动")
+    p_drv.add_argument("--model", default=None, help="按型号匹配候选驱动")
+    p_drv.set_defaults(func=cmd_drivers)
+
+    # setup
+    p_setup = subparsers.add_parser("setup", help="安装网络打印机（优先完整驱动）")
+    p_setup.add_argument("host", help="打印机 IP 地址")
+    p_setup.add_argument("--name", default=None, help="队列名称（默认使用设备型号）")
+    p_setup.add_argument("--dry-run", action="store_true", help="只显示计划，不做更改")
+    p_setup.add_argument("--no-generic", action="store_true",
+                         help="拒绝通用驱动回退（宁可失败也不降级）")
+    p_setup.add_argument("--json", action="store_true", help="JSON 格式输出")
+    p_setup.set_defaults(func=cmd_setup)
+
+    # remove
+    p_rm = subparsers.add_parser("remove", help="删除打印机队列")
+    p_rm.add_argument("name", help="打印机名称")
+    p_rm.add_argument("--yes", action="store_true", help="确认删除")
+    p_rm.set_defaults(func=cmd_remove)
+
+    # set-default
+    p_sd = subparsers.add_parser("set-default", help="设置默认打印机")
+    p_sd.add_argument("name", help="打印机名称")
+    p_sd.set_defaults(func=cmd_set_default)
 
     args = parser.parse_args()
 
