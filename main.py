@@ -339,7 +339,7 @@ def cmd_driver_search(args):
 
     result = commands_net.driver_search(
         model=args.model, host=args.host, region=args.region,
-        os_code=args.os, download_dir=args.download,
+        os_code=args.os, download_dir=args.download, open_browser=args.open,
     )
     if args.json:
         output_json(result)
@@ -374,9 +374,29 @@ def cmd_driver_search(args):
     if dl:
         if dl.get("ok"):
             print(f"\n⬇️  Gespeichert: {dl['path']}")
+            print(f"   {dl['size_bytes']} Bytes  |  SHA-256 {dl['sha256']}")
             print(f"   {dl['note']}")
+        elif dl.get("blocked"):
+            print(f"\n🚫 {dl.get('error')}")
+            print("   Der Hersteller liefert die Datei nur an echte Browser-Sessions aus.")
+            print(f"   Im Browser oeffnen:  printer-ai driver-search {_echo_args(args)} --open")
         else:
             print(f"\n❌ Download fehlgeschlagen: {dl.get('error')}")
+
+    opened = data.get("opened")
+    if opened:
+        if opened.get("ok"):
+            print(f"\n🌐 Im Browser geoeffnet: {opened['url']}")
+            print("   Der Download laeuft dort. Danach: printer-ai setup <IP> --no-generic")
+        else:
+            print(f"\n❌ Konnte den Browser nicht oeffnen: {opened.get('error')}")
+
+
+def _echo_args(args):
+    """Rebuild the identifying part of the command for a follow-up hint."""
+    if args.host:
+        return f"--host {args.host}"
+    return f'"{args.model}"'
 
 
 def cmd_remove(args):
@@ -493,7 +513,9 @@ def main():
     p_ds.add_argument("--region", default=None, help="两位区域代码，如 DE / US（默认: 系统区域）")
     p_ds.add_argument("--os", default=None, help="厂商 OS 代码（默认: 自动检测）")
     p_ds.add_argument("--download", default=None, metavar="DIR",
-                      help="下载安装包到该目录（仅下载，不执行）")
+                      help="下载安装包到该目录（仅下载并校验，绝不执行）")
+    p_ds.add_argument("--open", action="store_true",
+                      help="在默认浏览器中打开下载链接（厂商拒绝脚本下载时使用）")
     p_ds.add_argument("--json", action="store_true", help="JSON 格式输出")
     p_ds.set_defaults(func=cmd_driver_search)
 

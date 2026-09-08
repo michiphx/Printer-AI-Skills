@@ -193,6 +193,7 @@ def driver_search(
     region: Optional[str] = None,
     os_code: Optional[str] = None,
     download_dir: Optional[str] = None,
+    open_browser: bool = False,
 ) -> Dict[str, Any]:
     """Find a manufacturer driver online for a model, or for the device at `host`."""
     from local_printer import vendor_drivers
@@ -213,17 +214,36 @@ def driver_search(
     if identity:
         result["identity"] = identity
 
+    downloads = result.get("downloads") or []
+    best = downloads[0] if downloads else None
+
     if download_dir:
-        downloads = result.get("downloads") or []
-        if not downloads:
+        if not best:
+            # No direct URL: the portal itself is the only way through.
             result["download"] = {
                 "ok": False,
-                "error": "no direct download URL available - use download_page",
+                "blocked": True,
+                "error": "no direct download URL available (vendor API unreachable)",
+                "open_in_browser_url": result.get("download_page"),
             }
         else:
             result["download"] = vendor_drivers.download_driver(
-                downloads[0]["url"], download_dir
+                best["url"], download_dir, expected_size=best.get("size_bytes")
             )
+
+    if open_browser:
+        # Prefer the exact installer, fall back to the filtered download page.
+        target = (
+            (result.get("download") or {}).get("open_in_browser_url")
+            or (best or {}).get("url")
+            or result.get("download_page")
+            or result.get("support_site")
+        )
+        if target:
+            result["opened"] = vendor_drivers.open_in_browser(target)
+        else:
+            result["opened"] = {"ok": False, "error": "no URL to open for this vendor"}
+
     return APIResponse.success(result).to_dict()
 
 

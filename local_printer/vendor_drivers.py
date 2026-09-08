@@ -274,34 +274,117 @@ def find_driver(
     return base
 
 
-def download_driver(url: str, dest_dir: str, timeout: float = 300.0) -> Dict[str, Any]:
-    """Fetch an installer to `dest_dir`. Never executes it.
+def open_in_browser(url: str) -> Dict[str, Any]:
+    """Hand a URL to the user's default browser.
 
-    Only called when the user explicitly asks -- see the --download flag.
+    Vendor portals that refuse scripted clients still serve a normal browser
+    session, so this is the reliable way to complete a download the CLI cannot
+    fetch itself.
     """
+    import webbrowser
+
+    if not url.startswith("https://"):
+        return {"ok": False, "error": "refusing to open a non-HTTPS URL"}
+    try:
+        opened = webbrowser.open(url)
+    except Exception as exc:
+        return {"ok": False, "error": f"could not open a browser: {exc}"}
+    return {
+        "ok": bool(opened),
+        "url": url,
+        "note": "Opened in your default browser - the download runs there.",
+    }
+
+
+def download_driver(
+    url: str, dest_dir: str, timeout: float = 600.0, expected_size: Optional[int] = None
+) -> Dict[str, Any]:
+    """Fetch an installer to `dest_dir`, verify it, and never execute it.
+
+    Runs only when the user passes --download.  Vendor CDNs commonly sit behind
+    a WAF that rejects scripted clients; that case is reported as `blocked` with
+    the URL to open in a browser instead, rather than as a bare failure.
+    """
+    import hashlib
+
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https":
         return {"ok": False, "error": "refusing to download over a non-HTTPS URL"}
     filename = os.path.basename(parsed.path) or "driver.bin"
     os.makedirs(dest_dir, exist_ok=True)
     target = os.path.join(dest_dir, filename)
+    partial = target + ".part"
 
-    request = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": BROWSER_UA,
+            "Accept": "*/*",
+            "Referer": EPSON_PAGE,
+        },
+    )
+    digest = hashlib.sha256()
+    written = 0
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response, open(
-            target, "wb"
+            partial, "wb"
         ) as handle:
+            declared = response.headers.get("Content-Length")
             while True:
                 chunk = response.read(262144)
                 if not chunk:
                     break
                 handle.write(chunk)
+                digest.update(chunk)
+                written += len(chunk)
+    except urllib.error.HTTPError as exc:
+        _unlink(partial)
+        blocked = exc.code in (403, 406, 429)
+        return {
+            "ok": False,
+            "blocked": blocked,
+            "http_status": exc.code,
+            "error": (
+                f"the vendor's CDN rejected a scripted download (HTTP {exc.code}). "
+                "It only serves browser sessions."
+                if blocked else f"download failed: HTTP {exc.code}"
+            ),
+            "open_in_browser_url": url if blocked else None,
+        }
     except (urllib.error.URLError, OSError) as exc:
+        _unlink(partial)
         return {"ok": False, "error": f"download failed: {exc}"}
 
+    # Sanity-check before handing the user something to run.
+    problems: List[str] = []
+    if expected_size and written != expected_size:
+        problems.append(f"size mismatch: got {written}, expected {expected_size}")
+    if declared and written != int(declared):
+        problems.append(f"truncated: got {written} of {declared} bytes")
+    if filename.lower().endswith(".exe"):
+        with open(partial, "rb") as handle:
+            if handle.read(2) != b"MZ":
+                problems.append("not a Windows executable (missing MZ header)")
+
+    if problems:
+        _unlink(partial)
+        return {"ok": False, "error": "; ".join(problems)}
+
+    os.replace(partial, target)
     return {
         "ok": True,
         "path": target,
-        "size_bytes": os.path.getsize(target),
-        "note": "Downloaded only. Run the installer yourself, then re-run `printer-ai setup`.",
+        "size_bytes": written,
+        "sha256": digest.hexdigest(),
+        "note": (
+            "Downloaded and verified, not executed. Run the installer yourself, "
+            "then re-run `printer-ai setup` to pick up the vendor driver."
+        ),
     }
+
+
+def _unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
