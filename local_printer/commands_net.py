@@ -187,6 +187,46 @@ def _setup_cups(host: str, name: Optional[str] = None, dry_run: bool = False) ->
     }).to_dict()
 
 
+def driver_search(
+    model: Optional[str] = None,
+    host: Optional[str] = None,
+    region: Optional[str] = None,
+    os_code: Optional[str] = None,
+    download_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Find a manufacturer driver online for a model, or for the device at `host`."""
+    from local_printer import vendor_drivers
+
+    if not model and not host:
+        return APIResponse.error(400, "give either a model or --host").to_dict()
+
+    identity = None
+    if not model:
+        identity = discovery.ipp_query(host, timeout=4.0)
+        if not identity or not identity.get("make_and_model"):
+            return APIResponse.error(
+                404, f"could not read a model from {host} over IPP - pass the model explicitly"
+            ).to_dict()
+        model = identity["make_and_model"]
+
+    result = vendor_drivers.find_driver(model, region=region, os_code=os_code)
+    if identity:
+        result["identity"] = identity
+
+    if download_dir:
+        downloads = result.get("downloads") or []
+        if not downloads:
+            result["download"] = {
+                "ok": False,
+                "error": "no direct download URL available - use download_page",
+            }
+        else:
+            result["download"] = vendor_drivers.download_driver(
+                downloads[0]["url"], download_dir
+            )
+    return APIResponse.success(result).to_dict()
+
+
 def remove(name: str) -> Dict[str, Any]:
     if not IS_WINDOWS:
         return APIResponse.error(501, "remove is only implemented on Windows").to_dict()

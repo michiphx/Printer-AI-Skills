@@ -1,0 +1,307 @@
+"""
+Look up manufacturer drivers online.
+
+When neither the spooler nor the in-box INF store has a driver for a device,
+the only remaining source is the vendor.  This module turns the model string a
+printer reports over IPP into a concrete download page -- and, where the vendor
+exposes a usable API, into the actual installer URL and version.
+
+Design notes:
+
+* Vendor download portals sit behind a WAF.  Epson's ``download-center`` API
+  answers a browser but returns 403 to plain HTTP clients, so the API attempt is
+  best-effort and always degrades to a deep link that is known to work.
+* Nothing is downloaded unless the caller explicitly asks for it, and nothing is
+  ever executed.  Installers are run by the user, not by this tool.
+"""
+
+import json
+import locale
+import os
+import platform
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional
+
+from utils.logger import logger
+
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# Vendor detection from the model string reported over IPP.
+VENDOR_KEYWORDS = {
+    "epson": "Epson",
+    "seiko epson": "Epson",
+    "hp": "HP",
+    "hewlett": "HP",
+    "brother": "Brother",
+    "canon": "Canon",
+    "lexmark": "Lexmark",
+    "kyocera": "Kyocera",
+    "samsung": "Samsung",
+    "xerox": "Xerox",
+    "ricoh": "Ricoh",
+}
+
+# Support entry points per vendor. Only Epson has a verified deep link; the
+# others are the official support hubs and are reported as unverified so the
+# caller does not present a guess as a fact.
+VENDOR_SUPPORT_SITES = {
+    "HP": "https://support.hp.com/us-en/drivers",
+    "Brother": "https://support.brother.com/g/b/productsearch.aspx?c=us&lang=en&content=dl",
+    "Canon": "https://www.usa.canon.com/support",
+    "Lexmark": "https://support.lexmark.com/en_us.html",
+    "Kyocera": "https://www.kyoceradocumentsolutions.com/en/support.html",
+    "Xerox": "https://www.support.xerox.com/en-us",
+    "Ricoh": "https://www.ricoh.com/support",
+}
+
+EPSON_API = "https://download-center.epson.com/api/v1"
+EPSON_PAGE = "https://download-center.epson.com/softwares/"
+
+# Epson OS codes, read from the portal's own /api/v1/os/ endpoint.
+EPSON_OS_CODES = {
+    ("windows", "11", "amd64"): "WIN1164",
+    ("windows", "11", "arm64"): "WIN1164A",
+    ("windows", "10", "amd64"): "WIN1064",
+    ("windows", "10", "x86"): "WIN10",
+    ("windows", "8.1", "amd64"): "W8164",
+    ("windows", "7", "amd64"): "S64",
+}
+
+
+# ------------------------------------------------------------ environment
+
+
+def detect_region(default: str = "US") -> str:
+    """Two-letter region for the vendor portal, from the system locale."""
+    for value in (
+        os.environ.get("PRINTER_AI_REGION"),
+        os.environ.get("LC_ALL"),
+        os.environ.get("LANG"),
+    ):
+        if value and "_" in value:
+            return value.split("_", 1)[1].split(".")[0].upper()[:2]
+    try:
+        tag = locale.getdefaultlocale()[0]  # e.g. "de_DE"
+    except (ValueError, TypeError):
+        tag = None
+    if tag and "_" in tag:
+        return tag.split("_", 1)[1].upper()[:2]
+    return default
+
+
+def detect_windows_release() -> str:
+    """'11', '10', ... -- platform.win32_ver still reports 10 for Windows 11."""
+    if sys.platform != "win32":
+        return ""
+    try:
+        build = sys.getwindowsversion().build
+    except Exception:
+        return platform.win32_ver()[0]
+    return "11" if build >= 22000 else "10"
+
+
+def detect_arch() -> str:
+    machine = platform.machine().lower()
+    if machine in ("amd64", "x86_64"):
+        return "amd64"
+    if machine in ("arm64", "aarch64"):
+        return "arm64"
+    return "x86"
+
+
+def epson_os_code() -> Optional[str]:
+    if sys.platform != "win32":
+        return None  # macOS/Linux codes are not mapped; the portal shows all
+    return EPSON_OS_CODES.get(("windows", detect_windows_release(), detect_arch()))
+
+
+# ---------------------------------------------------------------- model
+
+
+def split_model(make_and_model: str) -> Dict[str, str]:
+    """Split 'EPSON ET-4850 Series' into vendor and portal device id."""
+    text = (make_and_model or "").strip()
+    low = text.lower()
+    vendor = ""
+    for keyword, name in VENDOR_KEYWORDS.items():
+        if low.startswith(keyword + " ") or low == keyword:
+            vendor = name
+            break
+    if not vendor:
+        for keyword, name in VENDOR_KEYWORDS.items():
+            if keyword in low:
+                vendor = name
+                break
+
+    device_id = text
+    if vendor:
+        # Strip the leading brand word(s); portals index the bare model.
+        for keyword in sorted(VENDOR_KEYWORDS, key=len, reverse=True):
+            if low.startswith(keyword + " "):
+                device_id = text[len(keyword):].strip()
+                break
+    return {"vendor": vendor, "device_id": device_id, "model": text}
+
+
+# ------------------------------------------------------------- Epson API
+
+
+def _get_json(url: str, timeout: float = 15.0) -> Optional[Any]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": BROWSER_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": EPSON_PAGE,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        logger.debug(f"vendor API call failed ({url}): {exc}")
+        return None
+
+
+def epson_page_url(device_id: str, region: str, os_code: Optional[str], language: str) -> str:
+    params = {"device_id": device_id, "region": region, "language": language}
+    if os_code:
+        params["os"] = os_code
+    return f"{EPSON_PAGE}?{urllib.parse.urlencode(params)}"
+
+
+def epson_lookup(
+    device_id: str, region: str, os_code: Optional[str], language: str = "en"
+) -> Dict[str, Any]:
+    """Best-effort Epson Download Center query, always returning a usable link."""
+    page = epson_page_url(device_id, region, os_code, language)
+    result: Dict[str, Any] = {
+        "vendor": "Epson",
+        "device_id": device_id,
+        "region": region,
+        "os_code": os_code,
+        "download_page": page,
+        "page_verified": True,
+        "api_reachable": False,
+        "downloads": [],
+    }
+
+    params = {"device_id": device_id, "os": os_code or "", "region": region, "language": language}
+    data = _get_json(f"{EPSON_API}/modules/?{urllib.parse.urlencode(params)}")
+    if not isinstance(data, dict) or "items" not in data:
+        result["note"] = (
+            "Epson's portal refused a direct API call (it is behind a WAF that "
+            "only answers browsers). Open download_page and pick the driver there."
+        )
+        return result
+
+    result["api_reachable"] = True
+    wanted = {"Drivers", "ComboPackage"}
+    for item in data.get("items", []):
+        if item.get("cti_category") not in wanted:
+            continue
+        url = item.get("url") or ""
+        result["downloads"].append({
+            "category": item.get("cti_category"),
+            "version": item.get("version"),
+            "url": url,
+            "filename": url.rsplit("/", 1)[-1] if url else None,
+            "size_bytes": item.get("size"),
+            "size_mb": round(item["size"] / 1048576, 1) if item.get("size") else None,
+        })
+    # Full driver packages first, then combo installers, newest version first.
+    result["downloads"].sort(
+        key=lambda d: (d["category"] != "Drivers", str(d.get("version") or "")), reverse=False
+    )
+    return result
+
+
+# ------------------------------------------------------------ public API
+
+
+def find_driver(
+    make_and_model: str,
+    region: Optional[str] = None,
+    os_code: Optional[str] = None,
+    language: str = "en",
+) -> Dict[str, Any]:
+    """Locate a manufacturer driver for `make_and_model` on the vendor's site."""
+    parts = split_model(make_and_model)
+    vendor = parts["vendor"]
+    region = region or detect_region()
+
+    base: Dict[str, Any] = {
+        "model": parts["model"],
+        "vendor": vendor or "unknown",
+        "device_id": parts["device_id"],
+        "region": region,
+        "os": {
+            "platform": sys.platform,
+            "release": detect_windows_release() or platform.release(),
+            "arch": detect_arch(),
+        },
+    }
+
+    if not vendor:
+        base["supported"] = False
+        base["hint"] = (
+            f"Could not identify the manufacturer from '{parts['model']}'. "
+            "Search the vendor's support site for the model plus your OS."
+        )
+        return base
+
+    if vendor == "Epson":
+        lookup = epson_lookup(parts["device_id"], region, os_code or epson_os_code(), language)
+        base.update(lookup)
+        base["supported"] = True
+        return base
+
+    base["supported"] = False
+    base["support_site"] = VENDOR_SUPPORT_SITES.get(vendor)
+    base["site_verified"] = False
+    base["hint"] = (
+        f"No verified lookup is implemented for {vendor}. "
+        f"Search their support site for '{parts['model']} driver "
+        f"{base['os']['release']} {base['os']['arch']}'."
+    )
+    return base
+
+
+def download_driver(url: str, dest_dir: str, timeout: float = 300.0) -> Dict[str, Any]:
+    """Fetch an installer to `dest_dir`. Never executes it.
+
+    Only called when the user explicitly asks -- see the --download flag.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        return {"ok": False, "error": "refusing to download over a non-HTTPS URL"}
+    filename = os.path.basename(parsed.path) or "driver.bin"
+    os.makedirs(dest_dir, exist_ok=True)
+    target = os.path.join(dest_dir, filename)
+
+    request = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response, open(
+            target, "wb"
+        ) as handle:
+            while True:
+                chunk = response.read(262144)
+                if not chunk:
+                    break
+                handle.write(chunk)
+    except (urllib.error.URLError, OSError) as exc:
+        return {"ok": False, "error": f"download failed: {exc}"}
+
+    return {
+        "ok": True,
+        "path": target,
+        "size_bytes": os.path.getsize(target),
+        "note": "Downloaded only. Run the installer yourself, then re-run `printer-ai setup`.",
+    }

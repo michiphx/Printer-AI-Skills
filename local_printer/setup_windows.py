@@ -310,7 +310,17 @@ def plan_setup(host: str, name: Optional[str] = None) -> Dict[str, Any]:
     }
 
     steps = _strategy_ladder(host, identity, open_ports, candidates)
-    return {
+
+    # Nothing local matches the device: the only real driver left is the
+    # vendor's, so look it up rather than silently settling for generic.
+    vendor_lookup = None
+    no_local_driver = not candidates["vendor_installed"] and not candidates["vendor_available_inbox"]
+    if model and no_local_driver:
+        from local_printer import vendor_drivers
+
+        vendor_lookup = vendor_drivers.find_driver(model)
+
+    result = {
         "host": host,
         "reachable": True,
         "open_ports": discovery.open_port_names(open_ports),
@@ -319,11 +329,19 @@ def plan_setup(host: str, name: Optional[str] = None) -> Dict[str, Any]:
         "suggested_name": name or (model or f"Printer {host}"),
         "driver_candidates": candidates,
         "strategies": steps,
+        "vendor_driver_lookup": vendor_lookup,
         "elevated": is_elevated(),
         "note": None if is_elevated() else
         "Not running elevated: IPP/WSD ports and driver installation need "
         "administrator rights. Only the raw-9100 fallback is likely to succeed.",
     }
+    if vendor_lookup:
+        result["driver_hint"] = (
+            f"No {model} driver is installed or shipped with Windows. "
+            "Install the manufacturer driver from vendor_driver_lookup.download_page, "
+            "then re-run setup to get the full feature set."
+        )
+    return result
 
 
 def _strategy_ladder(

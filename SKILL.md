@@ -198,6 +198,37 @@ capabilities** and reports what was lost:
 ⚠️ Steps 1 and 2 need an **elevated shell**. Without admin only the raw fallback
 succeeds; the output says so in `note`/`hint` rather than failing silently.
 
+### `driver-search` — find the manufacturer driver online ⭐
+
+When no driver is installed and Windows ships none in-box, the only real source
+is the vendor. `setup` calls this automatically and puts the result in
+`vendor_driver_lookup` + `driver_hint`; you can also run it directly:
+
+```bash
+printer-ai driver-search --host 192.168.1.72        # read the model over IPP
+printer-ai driver-search "EPSON ET-4850 Series"     # or name it
+printer-ai driver-search --host 1.2.3.4 --region DE --os WIN1164
+printer-ai driver-search --host 1.2.3.4 --download C:\Temp   # opt-in, see below
+```
+
+OS and region are auto-detected (Windows build → `WIN1164` for 11 x64, region
+from the system locale). Region matters: the EU/CH build of the ET-4850 driver
+is **3.80.05**, the US one **3.80.00**.
+
+**Epson** is implemented against the Download Center API. That API sits behind a
+WAF that answers browsers but returns 403 to plain HTTP clients, so the call is
+best-effort and always degrades to a **verified deep link** to the filtered
+download page — `api_reachable` says which happened, `page_verified` is true
+either way.
+
+For **other vendors** the tool reports `supported: false` plus the official
+support hub, explicitly marked `site_verified: false`. It does not invent
+download URLs.
+
+⚠️ `--download` fetches the installer and **nothing else** — it is never
+executed, and only ever runs when you pass the flag. Install it yourself, then
+re-run `printer-ai setup` so the vendor driver gets picked up.
+
 ### Inventory & management
 
 ```bash

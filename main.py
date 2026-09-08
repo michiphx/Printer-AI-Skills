@@ -333,6 +333,52 @@ def cmd_setup(args):
         print(f"   💡 {data['hint']}")
 
 
+def cmd_driver_search(args):
+    """在厂商网站上查找驱动 - look up a manufacturer driver online"""
+    from local_printer import commands_net
+
+    result = commands_net.driver_search(
+        model=args.model, host=args.host, region=args.region,
+        os_code=args.os, download_dir=args.download,
+    )
+    if args.json:
+        output_json(result)
+        return
+    if result.get("code") != 200:
+        _fail(result)
+
+    data = result["data"]
+    print(f"Modell:  {data['model']}")
+    print(f"Hersteller: {data['vendor']}  |  Region: {data.get('region')}  |  "
+          f"OS: {data['os']['release']} {data['os']['arch']}")
+
+    if not data.get("supported"):
+        print(f"\n⚠️  {data.get('hint', '')}")
+        if data.get("support_site"):
+            print(f"   Support-Seite (ungeprueft): {data['support_site']}")
+        return
+
+    downloads = data.get("downloads") or []
+    if downloads:
+        print(f"\n✅ {len(downloads)} Treiberpaket(e) gefunden:\n")
+        for item in downloads:
+            size = f"{item['size_mb']} MB" if item.get("size_mb") else "?"
+            print(f"  [{item['category']}] v{item['version']}  ({size})")
+            print(f"      {item['filename']}")
+            print(f"      {item['url']}")
+    else:
+        print(f"\n⚠️  {data.get('note', 'Keine direkten Download-Links verfuegbar.')}")
+    print(f"\n🔗 Download-Seite: {data['download_page']}")
+
+    dl = data.get("download")
+    if dl:
+        if dl.get("ok"):
+            print(f"\n⬇️  Gespeichert: {dl['path']}")
+            print(f"   {dl['note']}")
+        else:
+            print(f"\n❌ Download fehlgeschlagen: {dl.get('error')}")
+
+
 def cmd_remove(args):
     from local_printer import commands_net
 
@@ -439,6 +485,17 @@ def main():
                          help="拒绝通用驱动回退（宁可失败也不降级）")
     p_setup.add_argument("--json", action="store_true", help="JSON 格式输出")
     p_setup.set_defaults(func=cmd_setup)
+
+    # driver-search
+    p_ds = subparsers.add_parser("driver-search", help="在厂商网站上查找驱动")
+    p_ds.add_argument("model", nargs="?", default=None, help="打印机型号，如 'EPSON ET-4850 Series'")
+    p_ds.add_argument("--host", default=None, help="改为通过 IPP 从该 IP 读取型号")
+    p_ds.add_argument("--region", default=None, help="两位区域代码，如 DE / US（默认: 系统区域）")
+    p_ds.add_argument("--os", default=None, help="厂商 OS 代码（默认: 自动检测）")
+    p_ds.add_argument("--download", default=None, metavar="DIR",
+                      help="下载安装包到该目录（仅下载，不执行）")
+    p_ds.add_argument("--json", action="store_true", help="JSON 格式输出")
+    p_ds.set_defaults(func=cmd_driver_search)
 
     # remove
     p_rm = subparsers.add_parser("remove", help="删除打印机队列")
