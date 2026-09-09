@@ -19,6 +19,8 @@ import json
 import locale
 import os
 import platform
+import re
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -27,6 +29,15 @@ from typing import Any, Dict, List, Optional
 
 from utils.logger import logger
 
+# Identify ourselves honestly by default: a vendor should be able to see what is
+# talking to them, and site operators can block or rate-limit us on sight.
+HONEST_UA = "printer-ai/1.0 (local printer CLI; python-urllib)"
+
+# The one exception. Epson's download-center sits behind a WAF that returns 403
+# to any client whose User-Agent is not a browser, so the *single* endpoint that
+# needs it gets a browser string; everything else uses HONEST_UA. This is not a
+# licence to spoof elsewhere -- if another vendor blocks us, the answer is
+# `open_in_browser`, not a wider disguise.
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -77,22 +88,70 @@ EPSON_OS_CODES = {
 # ------------------------------------------------------------ environment
 
 
-def detect_region(default: str = "US") -> str:
-    """Two-letter region for the vendor portal, from the system locale."""
-    for value in (
-        os.environ.get("PRINTER_AI_REGION"),
-        os.environ.get("LC_ALL"),
-        os.environ.get("LANG"),
-    ):
-        if value and "_" in value:
-            return value.split("_", 1)[1].split(".")[0].upper()[:2]
+def _region_from_tag(value: Optional[str], allow_bare: bool = False) -> Optional[str]:
+    """Pull the territory out of a locale tag, or accept a bare region code.
+
+    Handles 'de_DE', 'de-DE', 'de_DE.UTF-8', 'de_DE@euro'. `allow_bare` also
+    accepts a plain 'DE' -- only true for PRINTER_AI_REGION, where a two-letter
+    value is unambiguously a region; in LANG a bare 'de' is the *language*.
+    """
+    if not value:
+        return None
+    tag = value.strip().split(".")[0].split("@")[0]
+    if not tag or tag.upper() in ("C", "POSIX"):
+        return None
+    parts = re.split(r"[_-]", tag)
+    if len(parts) >= 2 and len(parts[1]) == 2 and parts[1].isalpha():
+        return parts[1].upper()
+    if allow_bare and len(parts) == 1 and len(parts[0]) == 2 and parts[0].isalpha():
+        return parts[0].upper()
+    return None
+
+
+def _windows_user_locale() -> Optional[str]:
+    """The user's locale name from Win32, e.g. 'de-DE'.
+
+    `locale.getlocale()` returns (None, None) on a fresh Python process on
+    Windows because the C locale has not been set, so ask the OS directly.
+    """
+    if sys.platform != "win32":
+        return None
     try:
-        tag = locale.getdefaultlocale()[0]  # e.g. "de_DE"
-    except (ValueError, TypeError):
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(85)  # LOCALE_NAME_MAX_LENGTH
+        if ctypes.windll.kernel32.GetUserDefaultLocaleName(buffer, len(buffer)):
+            return buffer.value or None
+    except Exception as exc:  # ctypes/OS quirks must never break a lookup
+        logger.debug(f"GetUserDefaultLocaleName failed: {exc}")
+    return None
+
+
+def detect_region(default: str = "US") -> str:
+    """Two-letter region for the vendor portal, from the system locale.
+
+    `PRINTER_AI_REGION` overrides everything and accepts either a bare region
+    ('DE') or a full locale tag ('de_DE').
+    """
+    for value, bare_ok in (
+        (os.environ.get("PRINTER_AI_REGION"), True),
+        (os.environ.get("LC_ALL"), False),
+        (os.environ.get("LANG"), False),
+    ):
+        region = _region_from_tag(value, allow_bare=bare_ok)
+        if region:
+            return region
+
+    # locale.getdefaultlocale() is deprecated since 3.11 and removed in 3.15.
+    try:
+        tag = locale.getlocale(locale.LC_CTYPE)[0]
+    except (ValueError, TypeError, locale.Error):
         tag = None
-    if tag and "_" in tag:
-        return tag.split("_", 1)[1].upper()[:2]
-    return default
+    region = _region_from_tag(tag)
+    if region:
+        return region
+
+    return _region_from_tag(_windows_user_locale()) or default
 
 
 def detect_windows_release() -> str:
@@ -152,16 +211,22 @@ def split_model(make_and_model: str) -> Dict[str, str]:
 # ------------------------------------------------------------- Epson API
 
 
-def _get_json(url: str, timeout: float = 15.0) -> Optional[Any]:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": BROWSER_UA,
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": EPSON_PAGE,
-        },
-    )
+def _get_json(url: str, timeout: float = 15.0, waf_bypass: bool = False) -> Optional[Any]:
+    """GET and decode JSON.
+
+    `waf_bypass` is reserved for Epson's download-center API, which 403s any
+    non-browser client. It sends the browser UA together with the Referer the
+    portal's own XHR carries -- the two only make sense as a pair, and neither is
+    sent for ordinary requests such as checking that a page exists.
+    """
+    headers = {
+        "User-Agent": BROWSER_UA if waf_bypass else HONEST_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if waf_bypass:
+        headers["Referer"] = EPSON_PAGE
+    request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8", "replace"))
@@ -180,7 +245,15 @@ def epson_page_url(device_id: str, region: str, os_code: Optional[str], language
 def epson_lookup(
     device_id: str, region: str, os_code: Optional[str], language: str = "en"
 ) -> Dict[str, Any]:
-    """Best-effort Epson Download Center query, always returning a usable link."""
+    """Best-effort Epson Download Center query, always returning a usable link.
+
+    Privacy: this sends `device_id` (the printer model), the OS code and the
+    region to Epson, so the vendor learns which printer model this machine is
+    attached to and roughly where it is.  Nothing else is transmitted, and no
+    identifier for the user or machine is included -- but because it does leave
+    the LAN, `setup` must ask before calling it rather than looking up drivers on
+    its own.
+    """
     page = epson_page_url(device_id, region, os_code, language)
     result: Dict[str, Any] = {
         "vendor": "Epson",
@@ -194,7 +267,9 @@ def epson_lookup(
     }
 
     params = {"device_id": device_id, "os": os_code or "", "region": region, "language": language}
-    data = _get_json(f"{EPSON_API}/modules/?{urllib.parse.urlencode(params)}")
+    data = _get_json(
+        f"{EPSON_API}/modules/?{urllib.parse.urlencode(params)}", waf_bypass=True
+    )
     if not isinstance(data, dict) or "items" not in data:
         result["note"] = (
             "Epson's portal refused a direct API call (it is behind a WAF that "
@@ -232,7 +307,14 @@ def find_driver(
     os_code: Optional[str] = None,
     language: str = "en",
 ) -> Dict[str, Any]:
-    """Locate a manufacturer driver for `make_and_model` on the vendor's site."""
+    """Locate a manufacturer driver for `make_and_model` on the vendor's site.
+
+    This is a network lookup against the manufacturer: the model string, the
+    detected OS code and the region are sent to the vendor's portal.  It is
+    therefore opt-in -- `setup` must not run it without the user asking, and
+    callers that want a purely local answer should stay with the in-box driver
+    store instead.
+    """
     parts = split_model(make_and_model)
     vendor = parts["vendor"]
     region = region or detect_region()
@@ -296,6 +378,77 @@ def open_in_browser(url: str) -> Dict[str, Any]:
     }
 
 
+# Names Windows still treats as devices, whatever the extension: opening
+# "CON.exe" for writing talks to the console, not to a file.
+_WINDOWS_RESERVED = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{n}" for n in range(1, 10)}
+    | {f"LPT{n}" for n in range(1, 10)}
+)
+
+
+def safe_filename(raw: str, fallback: str = "driver.bin") -> str:
+    """Turn a filename taken from a URL into one that is safe to create.
+
+    The server chooses this string, so it is untrusted input: it can carry path
+    separators, '..', shell metacharacters, or a Windows device name. Everything
+    outside [A-Za-z0-9._-] becomes '_', traversal segments are dropped, and a
+    reserved device name is prefixed so it can only ever name a real file inside
+    the destination directory.
+    """
+    name = os.path.basename((raw or "").replace("\\", "/").rsplit("/", 1)[-1])
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    name = name.lstrip(".") or ""
+    if not name or name in (".", ".."):
+        return fallback
+    stem = name.split(".", 1)[0].upper()
+    if stem in _WINDOWS_RESERVED:
+        name = f"driver_{name}"
+    return name[:150]
+
+
+def _authenticode_signature(path: str) -> Optional[Dict[str, Optional[str]]]:
+    """Best-effort Windows signature check of a downloaded installer.
+
+    Reports what Windows itself thinks of the publisher signature; a failure to
+    ask (no PowerShell, timeout, unparseable output) returns None rather than
+    implying the file is unsigned.
+    """
+    if sys.platform != "win32":
+        return None
+    # Single-quoted PowerShell literal: no expansion happens inside, so the only
+    # escape needed is doubling an embedded quote.
+    literal = "'" + os.path.abspath(path).replace("'", "''") + "'"
+    script = (
+        f"$s = Get-AuthenticodeSignature -LiteralPath {literal}; "
+        "Write-Output $s.Status; "
+        "if ($s.SignerCertificate) { Write-Output $s.SignerCertificate.Subject } "
+        "else { Write-Output '' }"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug(f"Authenticode check failed for {path}: {exc}")
+        return None
+    lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+    if not lines:
+        logger.debug(f"Authenticode check returned nothing for {path}: {proc.stderr}")
+        return None
+    return {"status": lines[0], "signer": lines[1] if len(lines) > 1 else None}
+
+
+VERIFICATION_NOTE = (
+    "size and executable-header only; authenticity NOT verified — "
+    "check the publisher signature before running"
+)
+
+
 def download_driver(
     url: str, dest_dir: str, timeout: float = 600.0, expected_size: Optional[int] = None
 ) -> Dict[str, Any]:
@@ -304,23 +457,36 @@ def download_driver(
     Runs only when the user passes --download.  Vendor CDNs commonly sit behind
     a WAF that rejects scripted clients; that case is reported as `blocked` with
     the URL to open in a browser instead, rather than as a bare failure.
+
+    The checks here are integrity checks, not authenticity checks: they say the
+    bytes arrived intact, not that the vendor produced them. The SHA-256 is
+    reported so the user can compare it against the vendor's published digest,
+    and on Windows the Authenticode signature is reported alongside it.
     """
     import hashlib
 
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https":
         return {"ok": False, "error": "refusing to download over a non-HTTPS URL"}
-    filename = os.path.basename(parsed.path) or "driver.bin"
+    filename = safe_filename(urllib.parse.unquote(parsed.path))
     os.makedirs(dest_dir, exist_ok=True)
-    target = os.path.join(dest_dir, filename)
+    target = os.path.join(os.path.abspath(dest_dir), filename)
     partial = target + ".part"
+
+    # Never clobber: the name comes from the server, and an existing file here
+    # may be something the user already downloaded and verified.
+    if os.path.exists(target):
+        return {"ok": False, "error": f"target exists: {target}"}
+    if os.path.exists(partial):
+        return {"ok": False, "error": f"target exists: {partial}"}
 
     request = urllib.request.Request(
         url,
         headers={
+            # Vendor CDNs share the portal's WAF, so the browser UA stays here;
+            # no Referer is forged -- the WAF gates on the UA.
             "User-Agent": BROWSER_UA,
             "Accept": "*/*",
-            "Referer": EPSON_PAGE,
         },
     )
     digest = hashlib.sha256()
@@ -370,15 +536,25 @@ def download_driver(
         _unlink(partial)
         return {"ok": False, "error": "; ".join(problems)}
 
-    os.replace(partial, target)
+    try:
+        os.replace(partial, target)
+    except OSError as exc:
+        _unlink(partial)
+        return {"ok": False, "error": f"could not write {target}: {exc}"}
+
     return {
         "ok": True,
         "path": target,
+        "filename": filename,
         "size_bytes": written,
         "sha256": digest.hexdigest(),
+        "verification": VERIFICATION_NOTE,
+        "signature": _authenticode_signature(target),
         "note": (
-            "Downloaded and verified, not executed. Run the installer yourself, "
-            "then re-run `printer-ai setup` to pick up the vendor driver."
+            "Downloaded, not executed. The size and header were checked; the "
+            "publisher was not. Compare the sha256 against the vendor's "
+            "published digest, check the signature, then run the installer "
+            "yourself and re-run `printer-ai setup` to pick up the driver."
         ),
     }
 

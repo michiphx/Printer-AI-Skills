@@ -17,6 +17,28 @@ This is a fork of [NullYing/Printer-AI-Skills](https://github.com/NullYing/Print
 - 🪟 **Windows helpers** (`scripts/`): pair a printer through Settings via UI Automation, purge stale WSD ports, run a job elevated
 - 🤖 **AI-ready**: CLI + SKILL.md for seamless AI integration
 
+## Limitations
+
+Please read these before you rely on the tool — they are real and current.
+
+- **Windows printing is raw.** `print` hands the file to the spooler as raw
+  data. Only printers that understand PDF or PostScript themselves will print a
+  PDF. Other formats are refused with code `415` — convert to PDF first. The
+  `--options` (DEVMODE) values are best-effort on this path.
+- **`setup`'s IPP-Everywhere strategy does not work on Windows 11.** IPP ports
+  cannot be created there, so that strategy is skipped. Use
+  `scripts/win-pair-printer.ps1` instead, which pairs the printer through
+  Windows Settings.
+- **`setup --vendor-lookup` contacts a manufacturer site.** Together with
+  `driver-search`, it is the only command that leaves your network to a vendor;
+  the printer model, your OS version and your region are sent. It is opt-in.
+- **`diagnose` cannot resolve Windows WSD-port queues.** Their address is not
+  stored in the port, so they are reported as `kind: unknown`.
+- **`discover` only scans this machine's own /24** unless you pass `--force`.
+- **macOS/Linux need CUPS headers for pycups.** Install them
+  (`apt install libcups2-dev` / `brew install cups`) or the printer backend
+  reports code `501`. The network commands keep working either way.
+
 ## Quick Start
 
 ### Installation
@@ -67,16 +89,19 @@ For a single project use `.claude/skills/printer-ai/` inside the project instead
 
 ## OpenClaw Skill
 
-Use with [OpenClaw](https://openclaw.com):
+Use with [OpenClaw](https://openclaw.com).
+
+⚠️ `npx clawhub install printer-ai-skills` installs the **upstream**
+[NullYing/Printer-AI-Skills](https://github.com/NullYing/Printer-AI-Skills)
+skill, not this fork. To get this fork, install the skill from the git clone as
+described under [Claude Code Skill](#claude-code-skill) above (copy `SKILL.md`
+and `scripts/` into the skill directory), then install the CLI:
 
 ```bash
-# 1. Install the Skill
-npx clawhub@latest install printer-ai-skills
-
-# 2. Install the CLI tool
+# 1. Install the CLI tool
 uv tool install git+https://github.com/michiphx/Printer-AI-Skills.git
 
-# 3. Verify
+# 2. Verify
 printer-ai printers
 ```
 
@@ -98,6 +123,10 @@ Once installed, AI will automatically read `SKILL.md` and use CLI commands to ma
    ```
 
 ## Commands
+
+Every command prints a JSON result carrying a `code`. The process exit code is
+`0` only when that `code` is `200`; any other `code` exits non-zero, so scripts
+and agents can branch on the exit status alone.
 
 | Command | Description |
 |---------|-------------|
@@ -126,9 +155,18 @@ Once installed, AI will automatically read `SKILL.md` and use CLI commands to ma
 
 `SKILL.md` explains when to use which, and the Windows pitfalls (TLS-only IPP printers, orphaned WSD ports, the Device Association Service) that the scripts work around.
 
+## Security notes
+
+- Printer names and hosts are passed to PowerShell as literals — they are never
+  interpolated into a command string.
+- `--download` never executes anything. It only checks the downloaded file's
+  size and header, and on Windows its Authenticode signer.
+- `scripts/win-run-elevated.ps1` shows a UAC prompt that the user has to
+  approve; nothing runs elevated without that click.
+
 ## License
 
-MIT License
+MIT License — see [LICENSE](LICENSE).
 
 ## See Also
 

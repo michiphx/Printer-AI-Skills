@@ -13,10 +13,12 @@ reported rather than hidden.
 """
 
 import ctypes
+import ipaddress
 import json
 import os
 import re
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils.logger import logger
@@ -34,6 +36,20 @@ GENERIC_DRIVERS = {
     "Microsoft Print To PDF",
 }
 
+# Windows rejects these in a queue name, and the spooler caps it well below this.
+MAX_QUEUE_NAME = 220
+_FORBIDDEN_NAME_CHARS = ("\\", ",")
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
+
+# Windows 11 and later; Add-PrinterPort cannot create an IPP port on these.
+WIN11_BUILD = 22000
+
+# Model words too generic to identify a driver on their own.
+INF_STOP_TOKENS = {
+    "epson", "hp", "canon", "brother",
+    "series", "printer", "class", "driver",
+}
+
 
 def is_elevated() -> bool:
     """True if the current process has administrator rights."""
@@ -41,6 +57,66 @@ def is_elevated() -> bool:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:  # pragma: no cover - non-Windows or restricted host
         return False
+
+
+def windows_build() -> int:
+    """The running Windows build number, or 0 when it cannot be read."""
+    try:
+        return int(sys.getwindowsversion().build)
+    except Exception:  # pragma: no cover - non-Windows
+        return 0
+
+
+def is_windows_11() -> bool:
+    """True on Windows 11 or later, where IPP ports cannot be scripted."""
+    return windows_build() >= WIN11_BUILD
+
+
+# ------------------------------------------------------- PowerShell plumbing
+
+
+def _ps_literal(value: Any) -> str:
+    """Quote `value` as a single-quoted PowerShell string literal.
+
+    Single-quoted PowerShell strings are fully literal: `$`, backticks and
+    `$(...)` subexpressions are not expanded, so a device-supplied name cannot
+    become code.  The only escape needed is doubling an embedded quote.
+
+    Every value that reaches a PowerShell command line -- printer names, driver
+    names, port names, hosts -- must go through here.  Never interpolate raw
+    text into a script.
+    """
+    text = "" if value is None else str(value)
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _valid_host(host: Any) -> bool:
+    """True if `host` is an IP address or a plausible hostname."""
+    if not isinstance(host, str) or not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return bool(_HOSTNAME_RE.match(host))
+
+
+def _name_error(value: Any, kind: str = "printer name") -> Optional[str]:
+    """Return why `value` is unusable as a queue/port name, or None if it is."""
+    if not isinstance(value, str) or not value.strip():
+        return f"invalid {kind}: must be a non-empty string"
+    for bad in _FORBIDDEN_NAME_CHARS:
+        if bad in value:
+            return f"invalid {kind}: must not contain {bad!r} (Windows forbids it)"
+    if len(value) > MAX_QUEUE_NAME:
+        return f"invalid {kind}: longer than {MAX_QUEUE_NAME} characters"
+    return None
+
+
+# PowerShell writes the OEM code page to a redirected stdout, which decodes as
+# mojibake -- or raises -- on any non-English Windows.  Force UTF-8 per call.
+_PS_PREAMBLE = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
 
 
 def _ps(script: str, timeout: int = 120) -> Tuple[bool, str, str]:
@@ -52,14 +128,22 @@ def _ps(script: str, timeout: int = 120) -> Tuple[bool, str, str]:
                 "-NoProfile",
                 "-NonInteractive",
                 "-ExecutionPolicy", "Bypass",
-                "-Command", script,
+                "-Command", _PS_PREAMBLE + script,
             ],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
-        return proc.returncode == 0, proc.stdout.strip(), proc.stderr.strip()
-    except (OSError, subprocess.SubprocessError) as exc:
+        err = (proc.stderr or "").strip()
+        if err.startswith(_PS_PREAMBLE):
+            # PowerShell prefixes -Command errors with the whole command text.
+            err = err.split(" : ", 1)[-1]
+        err = "\n".join(
+            line for line in err.splitlines() if not line.lstrip().startswith("+ ")
+        ).strip()
+        return proc.returncode == 0, (proc.stdout or "").strip(), err
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError, ValueError) as exc:
         logger.error(f"PowerShell call failed: {exc}")
         return False, "", str(exc)
 
@@ -118,16 +202,142 @@ def _score_driver(driver_name: str, model: str) -> int:
     return score
 
 
+def _strong_tokens(model: str) -> List[str]:
+    """Model words distinctive enough to identify a driver.
+
+    A token qualifies if it carries a digit (`et`+`4850`, `mfc`+`l2750dw`) or is
+    at least four letters long, and is not a manufacturer or filler word.  Weak
+    tokens alone must never drive a match: `all([])` is True, so a model that
+    reduces to nothing would otherwise claim every INF label in Windows.
+    """
+    strong: List[str] = []
+    for token in _model_tokens(model):
+        if token in INF_STOP_TOKENS:
+            continue
+        if any(ch.isdigit() for ch in token) or len(token) >= 4:
+            strong.append(token)
+    return strong
+
+
+def _read_inf(path: str) -> str:
+    """Decode an INF file, whatever encoding Windows shipped it in.
+
+    The in-box printer INFs are UTF-16LE; reading them as UTF-8 yields bytes
+    that decode to nothing usable, which silently turned this whole search into
+    a no-op.  Detect the BOM instead of assuming.
+    """
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16", errors="ignore")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig", errors="ignore")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        # Older INFs use the ANSI code page.
+        return raw.decode("cp1252", errors="ignore")
+
+
+def _inf_string_value(raw: str) -> str:
+    """The value of an INF `[Strings]` entry, without quotes or trailing comment."""
+    value = raw.strip()
+    if value.startswith('"'):
+        end = value.find('"', 1)
+        return value[1:end] if end > 0 else value[1:]
+    return value.split(";", 1)[0].strip()
+
+
+_INF_TOKEN_RE = re.compile(r"^%(.+)%$")
+
+# Sections that hold plumbing, not printer models.
+_INF_SKIP_SECTIONS = {
+    "version", "manufacturer", "sourcedisksnames", "sourcedisksfiles",
+    "destinationdirs", "defaultinstall", "previousnames", "controlflags",
+    "classinstall32", "signaturecheck",
+}
+
+
+def _parse_inf(text: str) -> Dict[str, List[str]]:
+    """Split an INF into `{section name (lower): [entry lines]}`."""
+    sections: Dict[str, List[str]] = {}
+    current = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(";"):
+            continue
+        if stripped.startswith("["):
+            end = stripped.find("]")
+            current = stripped[1:end].strip().lower() if end > 0 else ""
+            sections.setdefault(current, [])
+            continue
+        if current:
+            sections[current].append(stripped)
+    return sections
+
+
+def _inf_strings(sections: Dict[str, List[str]]) -> Dict[str, str]:
+    """The `[Strings]` token table: `{token (lower): human-readable value}`."""
+    table: Dict[str, str] = {}
+    for name, lines in sections.items():
+        if not name.startswith("strings"):
+            continue
+        for line in lines:
+            if "=" not in line:
+                continue
+            token, raw = line.split("=", 1)
+            value = _inf_string_value(raw)
+            if value:
+                table[token.strip().lower()] = value
+    return table
+
+
+def _inf_driver_names(sections: Dict[str, List[str]], strings: Dict[str, str]) -> List[str]:
+    """Candidate driver names from an INF, best-readable form first.
+
+    Model entries are written `%Token% = InstallSection, HardwareID`, so the key
+    names the driver -- but as a token.  Resolving it through `[Strings]` yields
+    the human-readable name the spooler actually accepts; a key already written
+    as a quoted literal is that name already.
+    """
+    resolved: List[str] = []
+    literal: List[str] = []
+    bare: List[str] = []
+    for name, lines in sections.items():
+        if name.startswith("strings") or name.split(".")[0] in _INF_SKIP_SECTIONS:
+            continue
+        for line in lines:
+            if "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip()
+            token = _INF_TOKEN_RE.match(key)
+            if token:
+                value = strings.get(token.group(1).strip().lower())
+                if value:
+                    resolved.append(value)
+            elif key.startswith('"'):
+                literal.append(key.strip('"'))
+            elif key:
+                bare.append(key)
+    # Values from [Strings] itself, for INFs that name the driver only there.
+    return resolved + literal + list(strings.values()) + bare
+
+
 def search_inf_drivers(model: str) -> List[str]:
     """Scan the in-box printer INF files for driver names matching `model`.
 
     These drivers are shipped with Windows but not installed until requested,
     so a hit here means `Add-PrinterDriver` has a real chance of succeeding.
+
+    Model entries are keyed by a `%Token%` that `[Strings]` maps to the
+    human-readable driver name, so tokens are resolved to those values before
+    matching -- the raw token (`EPSON.ET4850`) is not a name the spooler accepts.
     """
-    tokens = _model_tokens(model)
-    if not tokens:
+    strong = _strong_tokens(model)
+    if not strong:
+        # Nothing distinctive enough to match on -- claiming a driver here would
+        # be a guess dressed up as a finding.
         return []
-    strong = [t for t in tokens if len(t) > 2]
     matches: List[str] = []
     try:
         names = [
@@ -141,19 +351,17 @@ def search_inf_drivers(model: str) -> List[str]:
     for filename in names:
         path = os.path.join(INF_DIR, filename)
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-                text = handle.read()
+            text = _read_inf(path)
         except OSError:
             continue
-        for line in text.splitlines():
-            if "=" not in line or line.lstrip().startswith(";"):
+        sections = _parse_inf(text)
+        strings = _inf_strings(sections)
+        for candidate in _inf_driver_names(sections, strings):
+            if not candidate or len(candidate) > 120:
                 continue
-            label = line.split("=", 1)[0].strip().strip('"')
-            if not label or len(label) > 120:
-                continue
-            low = label.lower()
+            low = candidate.lower()
             if all(t in low for t in strong):
-                matches.append(label)
+                matches.append(candidate)
     # de-duplicate, keep order
     seen, unique = set(), []
     for m in matches:
@@ -192,20 +400,34 @@ def find_driver_candidates(model: str) -> Dict[str, Any]:
 
 def install_driver(name: str) -> Tuple[bool, str]:
     """Add a driver from the Windows driver store to the spooler."""
-    ok, _, err = _ps(f'Add-PrinterDriver -Name "{name}" -ErrorAction Stop')
+    if not isinstance(name, str) or not name.strip():
+        return False, "invalid driver name: must be a non-empty string"
+    ok, _, err = _ps(f"Add-PrinterDriver -Name {_ps_literal(name)} -ErrorAction Stop")
     return ok, err or ""
 
 
 def add_port(name: str, host: Optional[str] = None, port_number: int = 9100) -> Tuple[bool, str]:
     """Create a printer port; URL-shaped names use the IPP monitor."""
+    problem = _name_error(name, "port name")
+    if problem:
+        return False, problem
     existing = {p.get("Name") for p in list_ports() if isinstance(p, dict)}
     if name in existing:
         return True, "already exists"
     if "://" in name:
-        script = f'Add-PrinterPort -Name "{name}" -ErrorAction Stop'
+        script = f"Add-PrinterPort -Name {_ps_literal(name)} -ErrorAction Stop"
     else:
+        if not _valid_host(host):
+            return False, "invalid host"
+        try:
+            port_number = int(port_number)
+        except (TypeError, ValueError):
+            return False, "invalid port number"
+        if not 1 <= port_number <= 65535:
+            return False, "invalid port number"
         script = (
-            f'Add-PrinterPort -Name "{name}" -PrinterHostAddress "{host}" '
+            f"Add-PrinterPort -Name {_ps_literal(name)} "
+            f"-PrinterHostAddress {_ps_literal(host)} "
             f"-PortNumber {port_number} -ErrorAction Stop"
         )
     ok, _, err = _ps(script)
@@ -213,22 +435,51 @@ def add_port(name: str, host: Optional[str] = None, port_number: int = 9100) -> 
 
 
 def add_printer(name: str, driver: str, port: str) -> Tuple[bool, str]:
+    """Create a print queue on an existing port."""
+    problem = _name_error(name, "printer name")
+    if problem:
+        return False, problem
+    if not isinstance(driver, str) or not driver.strip():
+        return False, "invalid driver name: must be a non-empty string"
+    problem = _name_error(port, "port name")
+    if problem:
+        return False, problem
+    if port.upper().startswith("WSD-"):
+        # A WSD-<guid> port is orphaned the moment its queue is deleted: the
+        # port survives, but a new queue placed on it fails every job.
+        return False, "refusing to reuse WSD port; pair through Windows Settings instead"
     ok, _, err = _ps(
-        f'Add-Printer -Name "{name}" -DriverName "{driver}" -PortName "{port}" -ErrorAction Stop'
+        f"Add-Printer -Name {_ps_literal(name)} "
+        f"-DriverName {_ps_literal(driver)} "
+        f"-PortName {_ps_literal(port)} -ErrorAction Stop"
     )
     return ok, err or ""
 
 
 def remove_printer(name: str) -> Tuple[bool, str]:
-    ok, _, err = _ps(f'Remove-Printer -Name "{name}" -ErrorAction Stop')
+    problem = _name_error(name, "printer name")
+    if problem:
+        return False, problem
+    ok, _, err = _ps(f"Remove-Printer -Name {_ps_literal(name)} -ErrorAction Stop")
     return ok, err or ""
 
 
 def set_default_printer(name: str) -> Tuple[bool, str]:
-    ok, _, err = _ps(
-        '(Get-WmiObject -Class Win32_Printer -Filter "Name=\'' + name.replace("'", "''") +
-        '\'").SetDefaultPrinter()'
+    problem = _name_error(name, "printer name")
+    if problem:
+        return False, problem
+    # Compared in PowerShell rather than spliced into a WQL filter, so the name
+    # is never parsed as query syntax.
+    script = (
+        f"$n = {_ps_literal(name)}; "
+        "$p = @(Get-CimInstance -ClassName Win32_Printer | Where-Object { $_.Name -eq $n }) "
+        "| Select-Object -First 1; "
+        "if (-not $p) { Write-Error ('no such printer: ' + $n); exit 1 }; "
+        "$r = Invoke-CimMethod -InputObject $p -MethodName SetDefaultPrinter; "
+        "if ($r.ReturnValue -ne 0) { "
+        "Write-Error ('SetDefaultPrinter returned ' + $r.ReturnValue); exit 1 }"
     )
+    ok, _, err = _ps(script)
     return ok, err or ""
 
 
@@ -293,8 +544,28 @@ def verify_capabilities(printer_name: str, identity: Optional[Dict[str, Any]]) -
 # ------------------------------------------------------------------- setup
 
 
-def plan_setup(host: str, name: Optional[str] = None) -> Dict[str, Any]:
-    """Work out what would be installed for `host`, changing nothing."""
+def _pairing_regex(model: str, host: str) -> str:
+    """A short, distinctive -Match value for win-pair-printer.ps1."""
+    strong = _strong_tokens(model)
+    numeric = [t for t in strong if any(ch.isdigit() for ch in t)]
+    token = (numeric or strong or [""])[0]
+    return token or model or host
+
+
+def plan_setup(
+    host: str,
+    name: Optional[str] = None,
+    vendor_lookup: bool = False,
+) -> Dict[str, Any]:
+    """Work out what would be installed for `host`, changing nothing.
+
+    `vendor_lookup` is opt-in: it sends the model, region and OS of this machine
+    to the manufacturer's download portal, which a plan-only run must not do
+    behind the user's back.
+    """
+    if not _valid_host(host):
+        return {"host": host, "reachable": False, "error": "invalid host"}
+
     identity = discovery.ipp_query(host, timeout=4.0)
     open_ports = discovery.probe_ports(host)
     if not discovery.is_printer_host(open_ports):
@@ -312,13 +583,19 @@ def plan_setup(host: str, name: Optional[str] = None) -> Dict[str, Any]:
     steps = _strategy_ladder(host, identity, open_ports, candidates)
 
     # Nothing local matches the device: the only real driver left is the
-    # vendor's, so look it up rather than silently settling for generic.
-    vendor_lookup = None
+    # vendor's.  Looking it up means talking to a third party, so it happens
+    # only when the caller asked for it.
     no_local_driver = not candidates["vendor_installed"] and not candidates["vendor_available_inbox"]
-    if model and no_local_driver:
+    lookup_result: Optional[Dict[str, Any]] = None
+    if not vendor_lookup:
+        lookup_result = {
+            "skipped": True,
+            "hint": "re-run with --vendor-lookup to query the manufacturer's download portal",
+        }
+    elif model and no_local_driver:
         from local_printer import vendor_drivers
 
-        vendor_lookup = vendor_drivers.find_driver(model)
+        lookup_result = vendor_drivers.find_driver(model)
 
     result = {
         "host": host,
@@ -329,13 +606,23 @@ def plan_setup(host: str, name: Optional[str] = None) -> Dict[str, Any]:
         "suggested_name": name or (model or f"Printer {host}"),
         "driver_candidates": candidates,
         "strategies": steps,
-        "vendor_driver_lookup": vendor_lookup,
+        "vendor_driver_lookup": lookup_result,
         "elevated": is_elevated(),
         "note": None if is_elevated() else
         "Not running elevated: IPP/WSD ports and driver installation need "
         "administrator rights. Only the raw-9100 fallback is likely to succeed.",
     }
-    if vendor_lookup:
+    if is_windows_11():
+        # Every scripted strategy left on Win11 is a downgrade; the UI pairing
+        # path is the only one that yields a negotiating queue.
+        result["recommended"] = (
+            f'scripts/win-pair-printer.ps1 -Match "{_pairing_regex(model, host)}"'
+        )
+        result["recommended_reason"] = (
+            "pairs through Windows Settings and yields the full-featured "
+            "Microsoft IPP Class Driver queue"
+        )
+    if lookup_result and not lookup_result.get("skipped"):
         result["driver_hint"] = (
             f"No {model} driver is installed or shipped with Windows. "
             "Install the manufacturer driver from vendor_driver_lookup.download_page, "
@@ -371,19 +658,27 @@ def _strategy_ladder(
         })
 
     # 2. IPP Everywhere -- the class driver negotiates capabilities live.
+    #    On Windows 11 Add-PrinterPort simply cannot create an IPP port, so the
+    #    strategy is listed for transparency but marked as the dead end it is.
+    win11 = is_windows_11()
     if open_ports.get(631):
         for scheme in ("https", "http"):
-            ladder.append({
+            entry: Dict[str, Any] = {
                 "rank": len(ladder) + 1,
                 "kind": "ipp-everywhere",
                 "driver": "Microsoft IPP Class Driver",
                 "needs_driver_install": False,
                 "port": f"{scheme}://{host}:631{ipp_path}",
                 "port_kind": "ipp",
-                "full_featured": True,
+                "full_featured": not win11,
                 "requires_elevation": True,
                 "reason": "class driver negotiates duplex/media from the device over IPP",
-            })
+            }
+            if win11:
+                entry["known_broken_on"] = (
+                    "Windows 11 (Add-PrinterPort cannot create IPP ports)"
+                )
+            ladder.append(entry)
 
     # 3. Raw 9100 -- always works, negotiates nothing.
     if open_ports.get(9100):
@@ -405,13 +700,14 @@ def setup_printer(
     name: Optional[str] = None,
     allow_generic: bool = True,
     dry_run: bool = False,
+    vendor_lookup: bool = False,
 ) -> Dict[str, Any]:
     """Install `host` as a printer, preferring full-featured strategies.
 
     Walks the strategy ladder until one succeeds, then verifies the result
     against the device's advertised capabilities.
     """
-    plan = plan_setup(host, name)
+    plan = plan_setup(host, name, vendor_lookup=vendor_lookup)
     if not plan.get("reachable"):
         return plan
     if dry_run:
@@ -419,11 +715,31 @@ def setup_printer(
 
     identity = plan["identity"]
     printer_name = name or plan["suggested_name"]
+    problem = _name_error(printer_name, "printer name")
+    if problem:
+        return {
+            "host": host,
+            "printer": printer_name,
+            "installed_with": None,
+            "attempts": [],
+            "identity": identity,
+            "elevated": is_elevated(),
+            "error": problem,
+            "hint": "pass a usable queue name with --name",
+        }
     attempts: List[Dict[str, Any]] = []
 
     for strategy in plan["strategies"]:
         if not allow_generic and not strategy["full_featured"]:
             attempts.append({**strategy, "status": "skipped", "detail": "generic setup not allowed"})
+            continue
+        if strategy.get("kind") == "ipp-everywhere" and is_windows_11():
+            attempts.append({
+                **strategy,
+                "status": "skipped",
+                "detail": "cannot create IPP ports on Windows 11; "
+                          "use scripts/win-pair-printer.ps1",
+            })
             continue
 
         record = {**strategy, "status": "failed", "detail": ""}
@@ -463,7 +779,7 @@ def setup_printer(
             "Printer installed but with reduced capabilities -- see verification.missing",
         }
 
-    return {
+    failure = {
         "host": host,
         "printer": printer_name,
         "installed_with": None,
@@ -474,3 +790,7 @@ def setup_printer(
         "hint": None if is_elevated() else
         "Run the CLI from an elevated shell -- port and driver installation need admin rights.",
     }
+    if plan.get("recommended"):
+        failure["recommended"] = plan["recommended"]
+        failure["recommended_reason"] = plan.get("recommended_reason")
+    return failure

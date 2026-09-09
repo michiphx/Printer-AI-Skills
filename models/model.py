@@ -61,11 +61,17 @@ class Printer:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Printer":
-        """Create from dictionary"""
+        """Create from dictionary.
+
+        The input is copied and unknown keys are dropped, so a caller's dict is
+        never mutated and a backend that grows an extra field cannot break this.
+        """
+        known = {f.name for f in fields(cls)}
+        values = {k: v for k, v in data.items() if k in known}
         # Convert string status to PrinterStatus enum
-        if "status" in data and isinstance(data["status"], str):
-            data["status"] = PrinterStatus.from_string(data["status"])
-        return cls(**data)
+        if isinstance(values.get("status"), str):
+            values["status"] = PrinterStatus.from_string(values["status"])
+        return cls(**values)
 
 
 @dataclass
@@ -102,6 +108,18 @@ class APIResponse:
         """Create server error response"""
         return cls(code=500, msg=msg, data=data or {})
 
+    @classmethod
+    def unsupported_media_type(
+        cls, msg: str, data: Dict[str, Any] = None
+    ) -> "APIResponse":
+        """Create a 415 response: the file format cannot be handled"""
+        return cls(code=415, msg=msg, data=data or {})
+
+    @classmethod
+    def not_implemented(cls, msg: str, data: Dict[str, Any] = None) -> "APIResponse":
+        """Create a 501 response: this platform/backend cannot do it"""
+        return cls(code=501, msg=msg, data=data or {})
+
 
 @dataclass
 class PrintJob:
@@ -125,8 +143,9 @@ class PrintJob:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PrintJob":
-        """Create from dictionary"""
-        return cls(**data)
+        """Create from dictionary, dropping unknown keys"""
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 

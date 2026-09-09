@@ -23,11 +23,21 @@ else:
 # ------------------------------------------------------------------ discover
 
 
-def discover(subnet: Optional[str] = None, timeout: float = 0.6, deep: bool = True) -> Dict[str, Any]:
-    """Sweep the local network for devices speaking a printing protocol."""
-    result = discovery.scan_subnet(subnet=subnet, timeout=timeout, deep=deep)
+def discover(
+    subnet: Optional[str] = None,
+    timeout: float = 0.6,
+    deep: bool = True,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Sweep the local network for devices speaking a printing protocol.
+
+    `force` allows a subnet that is neither one of this machine's own /24s nor
+    a private range; without it such a scan is refused with code 400.
+    """
+    result = discovery.scan_subnet(subnet=subnet, timeout=timeout, deep=deep, force=force)
     if result.get("error"):
-        return APIResponse.server_error(result["error"], result).to_dict()
+        code = result.get("code") if isinstance(result.get("code"), int) else 500
+        return APIResponse(code=code, msg=result["error"], data=result).to_dict()
     return APIResponse.success(result).to_dict()
 
 
@@ -73,9 +83,22 @@ def diagnose(deep: bool = True, timeout: float = 1.0) -> Dict[str, Any]:
             "port": printer.get("port", ""),
             "is_default": printer.get("is_default", False),
         }
-        host = discovery.host_of(printer.get("port")) or discovery.host_of(
-            printer.get("location")
+        port_name = str(printer.get("port") or "")
+        host = (
+            discovery.host_of(port_name)
+            or discovery.host_of(printer.get("uri"))
+            or discovery.host_of(printer.get("location"))
         )
+        if not host and port_name.upper().startswith("WSD-"):
+            # Windows WSD/IPP pairing ports resolve the device by UUID at print
+            # time; the port itself stores no address we could probe.
+            entry["kind"] = "unknown"
+            entry["really_online"] = None
+            entry["verdict"] = (
+                "WSD port - address not stored in the port; print a test page to check"
+            )
+            results.append(entry)
+            continue
         if not host:
             entry["kind"] = "virtual-or-local"
             entry["really_online"] = True
@@ -103,12 +126,14 @@ def diagnose(deep: bool = True, timeout: float = 1.0) -> Dict[str, Any]:
             entry["verdict"] = f"UNREACHABLE - nothing answers on {host}"
         results.append(entry)
 
-    online_count = sum(1 for r in results if r["really_online"])
+    online_count = sum(1 for r in results if r["really_online"] is True)
+    unknown_count = sum(1 for r in results if r["really_online"] is None)
     return APIResponse.success({
         "printers": results,
         "count": len(results),
         "online": online_count,
-        "offline": len(results) - online_count,
+        "unknown": unknown_count,
+        "offline": len(results) - online_count - unknown_count,
     }).to_dict()
 
 
@@ -140,11 +165,18 @@ def setup(
     name: Optional[str] = None,
     dry_run: bool = False,
     allow_generic: bool = True,
+    vendor_lookup: bool = False,
 ) -> Dict[str, Any]:
-    """Install a network printer, preferring a full-featured driver."""
+    """Install a network printer, preferring a full-featured driver.
+
+    `vendor_lookup` is off by default: querying the manufacturer's portal sends
+    the model and this machine's OS/region to a third party, which must be the
+    user's decision rather than a side effect of planning a setup.
+    """
     if IS_WINDOWS:
         result = _setup.setup_printer(
-            host, name=name, allow_generic=allow_generic, dry_run=dry_run
+            host, name=name, allow_generic=allow_generic, dry_run=dry_run,
+            vendor_lookup=vendor_lookup,
         )
         code = 200 if not result.get("error") else 500
         return APIResponse(code=code, msg=result.get("error", "success"), data=result).to_dict()

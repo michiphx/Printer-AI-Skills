@@ -27,3 +27,9 @@ env/
 
 # Ruff
 .ruff_cache/
+
+# Pytest
+.pytest_cache/
+
+# Partial downloads (driver-search --download)
+*.part

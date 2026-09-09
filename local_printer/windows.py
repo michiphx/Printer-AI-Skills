@@ -2,15 +2,12 @@
 Windows Printer Operations Module
 """
 
-import subprocess
-import json
-from typing import Dict, Any, List, Optional
+import os
+from typing import Dict, Any, List, Optional, Tuple
 
 import win32con
-import win32gui
 import win32print
 import pywintypes
-import win32ui
 from utils.logger import logger
 from models.model import (
     APIResponse,
@@ -171,8 +168,10 @@ def get_print_options_format():
 def get_printer_list() -> Dict[str, Any]:
     """Get the list of printers on Windows"""
     try:
-        # Get local and network printers
-        printers = win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL)
+        # Local queues plus \\server\share connections mapped into this profile
+        printers = win32print.EnumPrinters(
+            win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+        )
         printer_list: List[Printer] = []
 
         # Get default printer name
@@ -183,9 +182,13 @@ def get_printer_list() -> Dict[str, Any]:
             pass
 
         index = 0
+        seen = set()
         for printer in printers:
-            index += 1
             printer_name = printer[2]
+            if printer_name in seen:
+                continue
+            seen.add(printer_name)
+            index += 1
 
             # Get printer detailed information
             try:
@@ -267,38 +270,62 @@ def get_printer_list() -> Dict[str, Any]:
         return response.to_dict()
 
 
-def get_index_printer_from_list(index: int) -> Optional[Printer]:
+def resolve_printer(index: Optional[int] = None) -> Tuple[Optional[Printer], Optional[Dict[str, Any]]]:
+    """Resolve a printer index to a queue.
+
+    Args:
+        index: Printer index (1-based). None means "the default printer".
+
+    Returns:
+        (Printer, None) on success, (None, error_response_dict) otherwise.
+    """
+    printer_result = get_printer_list()
+    if printer_result.get("code") != 200:
+        return None, printer_result
+
+    printer_list = printer_result.get("data", {}).get("printers", [])
+    if not printer_list:
+        return None, APIResponse.not_found("no printers installed").to_dict()
+
+    if index is None:
+        for printer_data in printer_list:
+            if printer_data.get("is_default"):
+                return Printer.from_dict(dict(printer_data)), None
+        # Nothing is flagged as default - fall back to the first queue
+        return Printer.from_dict(dict(printer_list[0])), None
+
+    for printer_data in printer_list:
+        if printer_data.get("index") == index:
+            return Printer.from_dict(dict(printer_data)), None
+
+    return None, APIResponse.not_found(f"Printer not found: index {index}").to_dict()
+
+
+def get_index_printer_from_list(index: Optional[int] = None) -> Optional[Printer]:
     """Get printer by index from printer list
 
     Args:
-        index: Printer index (1-based)
+        index: Printer index (1-based), or None for the default printer
 
     Returns:
         Printer object if found, None otherwise
     """
-    printer_result = get_printer_list()
-    if printer_result["code"] != 200:
-        return None
-    printer_list = printer_result["data"]["printers"]
-    for printer_data in printer_list:
-        if printer_data["index"] == index:
-            return Printer.from_dict(printer_data)
-    return None
+    printer, _error = resolve_printer(index)
+    return printer
 
 
-def get_printer_status(index: int) -> Dict[str, Any]:
+def get_printer_status(index: Optional[int] = None) -> Dict[str, Any]:
     """Get printer status by index
 
     Args:
-        index: Printer index (1-based)
+        index: Printer index (1-based), or None for the default printer
 
     Returns:
         dict: Printer status information following CUPS format
     """
-    printer = get_index_printer_from_list(index)
+    printer, error = resolve_printer(index)
     if printer is None:
-        response = APIResponse.not_found("Printer not found")
-        return response.to_dict()
+        return error
 
     try:
         # Directly use printer data from the list
@@ -336,9 +363,9 @@ def get_dev_mode(devmode, printer_name):
         ):
             has_color = True
     except Exception as e:
-        logger.error("errors", "[get_dev_mode] error: %s", e)
+        logger.error(f"[get_dev_mode] DC_COLORDEVICE query failed: {e}")
 
-    if not has_color and dev_mode["Color"] != 1:
+    if not has_color and dev_mode.get("Color", 1) != 1:
         dev_mode["Color"] = 1
 
     return dev_mode
@@ -347,25 +374,37 @@ def get_dev_mode(devmode, printer_name):
 def get_capabilities_dict(printer_name, port, dc_names, dc_values):
     data = {}
     try:
-        name = win32print.DeviceCapabilities(printer_name, port, dc_names)
-        val = win32print.DeviceCapabilities(printer_name, port, dc_values)
-    except pywintypes.error as e:
-        print(dc_names, dc_values, e)
+        names = win32print.DeviceCapabilities(printer_name, port, dc_names)
+        values = win32print.DeviceCapabilities(printer_name, port, dc_values)
+    except Exception as e:
+        # Never print here: stdout carries the CLI's JSON payload
+        logger.error(
+            f"[get_capabilities_dict] {printer_name} ({dc_names}/{dc_values}) failed: {e}"
+        )
         return {}
-    for index, name in enumerate(name):
+    for index, name in enumerate(names or []):
         if not name:
             continue
-        data[name] = val[index]
+        try:
+            data[name] = values[index]
+        except (IndexError, TypeError):
+            continue
     return data
 
 
 def get_capabilities(printer_name):
+    """Collect the printer's capabilities.
+
+    Every DeviceCapabilities call is guarded on its own: a driver that fails one
+    query must not wipe out the capabilities that were read successfully.
+    """
     port = "FILE:"
     capabilities = {
         "Bins": get_capabilities_dict(
             printer_name, port, win32con.DC_BINNAMES, win32con.DC_BINS
         )
     }
+
     color = {"Black": 1}
     try:
         if (
@@ -373,11 +412,11 @@ def get_capabilities(printer_name):
             == 1
         ):
             color["Color"] = 2
-    except pywintypes.error as e:
+    except Exception as e:
         # No color option available
-        logger.error(printer_name, e)
-
+        logger.error(f"[get_capabilities] {printer_name} DC_COLORDEVICE failed: {e}")
     capabilities["Color"] = color
+
     media_types = get_capabilities_dict(
         printer_name, port, win32con.DC_MEDIATYPENAMES, win32con.DC_MEDIATYPES
     )
@@ -385,43 +424,53 @@ def get_capabilities(printer_name):
     capabilities["Papers"] = get_capabilities_dict(
         printer_name, port, win32con.DC_PAPERNAMES, win32con.DC_PAPERS
     )
+
     try:
         max_copies = win32print.DeviceCapabilities(
             printer_name, port, win32con.DC_COPIES
         )
-    except pywintypes.error as e:
-        logger.error("max_copies, error: %s" % e)
+    except Exception as e:
+        logger.error(f"[get_capabilities] {printer_name} DC_COPIES failed: {e}")
         max_copies = 99
-    capabilities["Copies"] = max_copies if max_copies > 1 else 99
-    orientation = {"Portrait": 1, "Landscape": 2}
-    capabilities["Orientation"] = orientation
+    if not isinstance(max_copies, int) or max_copies <= 1:
+        max_copies = 99
+    capabilities["Copies"] = max_copies
+
+    capabilities["Orientation"] = {"Portrait": 1, "Landscape": 2}
+
     duplex = {"Off": 1}
-    if win32print.DeviceCapabilities(printer_name, port, win32con.DC_DUPLEX) == 1:
-        duplex["Long Edge"] = 2
-        duplex["Short Edge"] = 3
+    try:
+        if win32print.DeviceCapabilities(printer_name, port, win32con.DC_DUPLEX) == 1:
+            duplex["Long Edge"] = 2
+            duplex["Short Edge"] = 3
+    except Exception as e:
+        logger.error(f"[get_capabilities] {printer_name} DC_DUPLEX failed: {e}")
     capabilities["Duplex"] = duplex
+
     return capabilities
 
 
-def get_printer_attrs(index: int):
-    printer = get_index_printer_from_list(index)
+def get_printer_attrs(index: Optional[int] = None):
+    printer, error = resolve_printer(index)
     if printer is None:
-        response = APIResponse.not_found("Printer not found")
-        return response.to_dict()
+        return error
     printer_name = printer.name
     try:
         p = win32print.OpenPrinter(printer_name)
-    except pywintypes.error as e:
-        logger.error("open_printer_fail: %s", e)
-        return APIResponse.error(500, "get printer params error, err: %s" % e).to_dict()
+    except Exception as e:
+        logger.error(f"[get_printer_attrs] open printer {printer_name} failed: {e}")
+        return APIResponse.error(500, f"get printer params error, err: {e}").to_dict()
+
     try:
-        printer = win32print.GetPrinter(p, 2)
-        devmode = printer["pDevMode"]
+        printer_info = win32print.GetPrinter(p, 2)
+        devmode = printer_info["pDevMode"]
         dev_mode = get_dev_mode(devmode, printer_name)
         capabilities = get_capabilities(printer_name)
-    except (win32ui.error, Exception) as e:
-        logger.error("[get_printer_params] error: %s", e)
-        return APIResponse.error(500, "get printer params error, err: %s" % e).to_dict()
+    except Exception as e:
+        logger.error(f"[get_printer_attrs] {printer_name} error: {e}")
+        return APIResponse.error(500, f"get printer params error, err: {e}").to_dict()
+    finally:
+        win32print.ClosePrinter(p)
 
     data = {
         "Capabilities": capabilities,
@@ -429,7 +478,6 @@ def get_printer_attrs(index: int):
         "Name": printer_name,
     }
 
-    win32print.ClosePrinter(p)
     result = APIResponse.success(data)
     return result.to_dict()
 
@@ -659,40 +707,58 @@ def set_dev_mode(devmode, options: WindowsPrintOptions):
     devmode.Fields = devmode.Fields | fields_to_set
 
 
-def print_file(index: int, file_path: str, options: Optional[WindowsPrintOptions] = None):
-    printer = get_index_printer_from_list(index)
+# Formats a printer can be expected to interpret when handed the bytes verbatim.
+RAW_SAFE_EXTENSIONS = (".pdf", ".ps", ".prn", ".txt")
+
+
+def print_file(index: Optional[int] = None, file_path: str = "",
+               options: Optional[WindowsPrintOptions] = None):
+    # The Windows backend writes the file to the spooler as RAW data, which
+    # bypasses the driver entirely. Anything the device cannot interpret on its
+    # own would come out as pages of garbage, so refuse it up front.
+    extension = os.path.splitext(file_path)[1].lower()
+    if extension not in RAW_SAFE_EXTENSIONS:
+        return APIResponse.unsupported_media_type(
+            "Windows backend can only send PDF/PS/PRN/TXT as raw data; "
+            "convert the document to PDF first",
+            {"file_path": file_path, "extension": extension},
+        ).to_dict()
+
+    printer, error = resolve_printer(index)
     if printer is None:
-        response = APIResponse.not_found("Printer not found")
-        return response.to_dict()
+        return error
     printer_name = printer.name
     try:
         p = win32print.OpenPrinter(printer_name)
-    except pywintypes.error as e:
-        logger.error("open_printer_fail: %s", e)
-        return APIResponse.error(500, "open printer error, err: %s" % e).to_dict()
+    except Exception as e:
+        logger.error(f"[print_file] open printer {printer_name} failed: {e}")
+        return APIResponse.error(500, f"open printer error, err: {e}").to_dict()
 
+    devmode = None
     try:
-        printer = win32print.GetPrinter(p, 2)
-        devmode = printer["pDevMode"]
+        printer_info = win32print.GetPrinter(p, 2)
+        devmode = printer_info["pDevMode"]
         set_dev_mode(devmode, options)
     except Exception as e:
         logger.error(
-            "print_prn set_dev_mode_fail, error: %s, devmode: %s, printer_model: %s",
-            e,
-            devmode,
-            printer_name,
+            f"[print_file] set_dev_mode failed on {printer_name}: {e} "
+            f"(devmode: {devmode})"
         )
         win32print.ClosePrinter(p)
         return APIResponse.server_error(f"Error printing file: {str(e)}").to_dict()
 
-    win32print.DocumentProperties(
-        0,
-        p,
-        printer_name,
-        devmode,
-        devmode,
-        win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER,
-    )
+    try:
+        win32print.DocumentProperties(
+            0,
+            p,
+            printer_name,
+            devmode,
+            devmode,
+            win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER,
+        )
+    except Exception as e:
+        # Not fatal: the job still goes out with the queue's own defaults
+        logger.error(f"[print_file] DocumentProperties failed on {printer_name}: {e}")
 
     job_id = None
     try:
@@ -719,6 +785,7 @@ def print_file(index: int, file_path: str, options: Optional[WindowsPrintOptions
             "file_path": file_path,
             "status": "submitted",
             "job_id": job_id,
+            "note": "sent as raw data; the printer must understand this format natively",
         }
     )
     return response.to_dict()

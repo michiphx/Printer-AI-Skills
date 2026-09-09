@@ -2,8 +2,12 @@
 Cups Printer Operations Module
 """
 
+# NOTE: pycups is a source-only distribution that needs a compiler and the CUPS
+# headers. The ImportError is deliberately NOT swallowed here - main.py imports
+# this module lazily and turns the failure into a 501 with an install hint, so
+# the stdlib-only commands keep working on machines without pycups.
 import cups
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from models.model import (
     Printer,
     APIResponse,
@@ -226,23 +230,48 @@ def get_printer_list() -> Dict[str, Any]:
         return response.to_dict()
 
 
-def get_index_printer_from_list(index: int) -> Optional[Printer]:
+def resolve_printer(index: Optional[int] = None) -> Tuple[Optional[Printer], Optional[Dict[str, Any]]]:
+    """Resolve a printer index to a queue.
+
+    Args:
+        index: Printer index (1-based). None means "the default printer".
+
+    Returns:
+        (Printer, None) on success, (None, error_response_dict) otherwise.
+    """
     printer_result = get_printer_list()
-    if printer_result["code"] != 200:
-        return None
-    printer_list = printer_result["data"]["printers"]
+    if printer_result.get("code") != 200:
+        return None, printer_result
+
+    printer_list = printer_result.get("data", {}).get("printers", [])
+    if not printer_list:
+        return None, APIResponse.not_found("no printers installed").to_dict()
+
+    if index is None:
+        for printer_data in printer_list:
+            if printer_data.get("is_default"):
+                return Printer.from_dict(dict(printer_data)), None
+        # Nothing is flagged as default - fall back to the first queue
+        return Printer.from_dict(dict(printer_list[0])), None
+
     for printer_data in printer_list:
-        if printer_data["index"] == index:
-            return Printer.from_dict(printer_data)
-    return None
+        if printer_data.get("index") == index:
+            return Printer.from_dict(dict(printer_data)), None
+
+    return None, APIResponse.not_found(f"Printer not found: index {index}").to_dict()
 
 
-def get_printer_status(index: int) -> Dict[str, Any]:
+def get_index_printer_from_list(index: Optional[int] = None) -> Optional[Printer]:
+    """Get printer by index (1-based), or the default printer when index is None."""
+    printer, _error = resolve_printer(index)
+    return printer
+
+
+def get_printer_status(index: Optional[int] = None) -> Dict[str, Any]:
     """Get printer status"""
-    printer = get_index_printer_from_list(index)
+    printer, error = resolve_printer(index)
     if printer is None:
-        response = APIResponse.not_found("Printer not found")
-        return response.to_dict()
+        return error
 
     try:
         # Connect to CUPS server
@@ -257,7 +286,7 @@ def get_printer_status(index: int) -> Dict[str, Any]:
 
         response = APIResponse.success(
             {
-                "index": index,
+                "index": printer.index,
                 "name": printer_name,
                 "is_accepting_jobs": printer_attrs.get(
                     "printer-is-accepting-jobs", True
@@ -272,12 +301,11 @@ def get_printer_status(index: int) -> Dict[str, Any]:
         return response.to_dict()
 
 
-def get_printer_attrs(index: int) -> Dict[str, Any]:
+def get_printer_attrs(index: Optional[int] = None) -> Dict[str, Any]:
     """Get printer attributes"""
     printer_result = get_printer_status(index)
-    if printer_result["code"] != 200:
-        response = APIResponse.not_found("Printer not found")
-        return response.to_dict()
+    if printer_result.get("code") != 200:
+        return printer_result
 
     try:
         conn = cups.Connection()
@@ -294,7 +322,8 @@ def get_printer_attrs(index: int) -> Dict[str, Any]:
 
 
 def print_file(
-    index: int, file_path: str, options: Optional[LinuxPrintOptions] = None
+    index: Optional[int] = None, file_path: str = "",
+    options: Optional[LinuxPrintOptions] = None
 ) -> dict:
     """
     Print file using CUPS
@@ -314,10 +343,9 @@ def print_file(
         response = APIResponse.not_found(f"File not found: {file_path}")
         return response.to_dict()
 
-    printer = get_index_printer_from_list(index)
+    printer, error = resolve_printer(index)
     if printer is None:
-        response = APIResponse.not_found("Printer not found")
-        return response.to_dict()
+        return error
 
     try:
         conn = cups.Connection()
@@ -456,7 +484,7 @@ def get_print_job_status(job_id: int) -> Dict[str, Any]:
     try:
         conn = cups.Connection()
 
-        # 使用 getJobAttributes 获取完整的任务信息
+        # Use getJobAttributes to fetch the full job record
         try:
             job = conn.getJobAttributes(job_id)
         except cups.IPPError:
@@ -477,8 +505,8 @@ def get_print_job_status(job_id: int) -> Dict[str, Any]:
             9: "completed",
         }
 
-        # 从 job-printer-uri 解析打印机名称
-        # 格式: ipp://localhost/printers/Canon_G5080_series_2
+        # Parse the printer name out of job-printer-uri
+        # Format: ipp://localhost/printers/Canon_G5080_series_2
         printer_name = ""
         printer_uri = job.get("job-printer-uri", "") or job.get("printer-uri", "")
         if printer_uri and "/printers/" in printer_uri:

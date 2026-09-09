@@ -1,5 +1,7 @@
 # Printer AI Skills
 
+> **说明**：本项目是 [NullYing/Printer-AI-Skills](https://github.com/NullYing/Printer-AI-Skills) 的一个 fork，其文档以英文版 [README.md](README.md) 为准并在那里持续维护。本中文文档可能滞后于英文版，缺少最新的功能说明、限制说明（Limitations）和安全说明（Security notes）。如果两者不一致，请以 README.md 为准。
+
 跨平台本地打印机 CLI，让 AI 助手通过 `printer-ai` 命令操作本地打印机。配合 OpenClaw / Cursor / Claude 等 AI Skill 系统使用。
 
 ## 功能特性
@@ -16,11 +18,11 @@
 
 ```bash
 # 全局安装（推荐）
-uv tool install git+https://github.com/NullYing/printer-ai-skills.git
+uv tool install git+https://github.com/michiphx/Printer-AI-Skills.git
 
 # 或本地开发安装
-git clone https://github.com/NullYing/printer-ai-skills.git
-cd printer-ai-skills
+git clone https://github.com/michiphx/Printer-AI-Skills.git
+cd Printer-AI-Skills
 uv sync
 ```
 
@@ -37,7 +39,7 @@ printer-ai job-status 123        # 查询任务状态
 
 ```bash
 # 1. 安装 CLI
-uv tool install git+https://github.com/NullYing/printer-ai-skills.git
+uv tool install git+https://github.com/michiphx/Printer-AI-Skills.git
 
 # 2. 验证
 printer-ai printers

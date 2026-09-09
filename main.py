@@ -1,395 +1,495 @@
 #!/usr/bin/env python3
 """
-跨平台本地打印机 CLI
+Cross-platform local printer CLI.
 
-提供 CLI 命令来操作本地打印机，支持 Windows、macOS、Linux。
-配合 AI Skill 系统（OpenClaw / Cursor / Claude 等）使用。
+Drives local printers on Windows, macOS and Linux, and is meant to be called
+by an AI skill system (OpenClaw / Cursor / Claude and friends) as well as by
+humans.
 
-用法:
-    printer-ai printers              # 列出打印机
-    printer-ai status [INDEX]        # 获取打印机状态
-    printer-ai attrs [INDEX]         # 获取打印机属性
-    printer-ai print FILE            # 打印文件
-    printer-ai jobs                  # 列出打印任务
-    printer-ai job-status JOB_ID     # 查询任务状态
-    printer-ai cancel-job JOB_ID     # 取消打印任务
+Usage:
+    printer-ai printers              # list printers
+    printer-ai status [INDEX]        # printer status (default printer if omitted)
+    printer-ai attrs [INDEX]         # printer attributes
+    printer-ai print FILE            # print a file
+    printer-ai jobs                  # list print jobs
+    printer-ai job-status JOB_ID     # query one job
+    printer-ai cancel-job JOB_ID     # cancel a job
 """
 
 import argparse
 import json
+import os
 import sys
 from sys import platform
 
-# 根据系统平台导入对应的打印机模块
-if platform == "win32":
-    from local_printer.windows import (
-        get_printer_list as _get_printer_list,
-        get_printer_status as _get_printer_status,
-        get_printer_attrs as _get_printer_attrs,
-        print_file as _print_file,
-        get_print_jobs as _get_print_jobs,
-        get_print_job_status as _get_print_job_status,
-        cancel_print_job as _cancel_print_job,
-    )
-    from models.model import WindowsPrintOptions as PrintOptionsClass
-elif platform == "linux" or platform == "darwin":
-    from local_printer.cups import (
-        get_printer_list as _get_printer_list,
-        get_printer_status as _get_printer_status,
-        get_printer_attrs as _get_printer_attrs,
-        print_file as _print_file,
-        get_print_jobs as _get_print_jobs,
-        get_print_job_status as _get_print_job_status,
-        cancel_print_job as _cancel_print_job,
-    )
-    from models.model import LinuxPrintOptions as PrintOptionsClass
-else:
-    _get_printer_list = None
-    _get_printer_status = None
-    _get_printer_attrs = None
-    _print_file = None
-    _get_print_jobs = None
-    _get_print_job_status = None
-    _cancel_print_job = None
-    PrintOptionsClass = None
+# The platform backends are imported lazily by _backend(). Importing them at
+# module load would make every command depend on the backend: on macOS/Linux
+# `import cups` (pycups) needs a compiler and the CUPS headers at install time,
+# and a failure there must not take down stdlib-only commands such as
+# discover / probe / driver-search.
+_INSTALL_HINT = (
+    "On macOS/Linux install CUPS headers and pycups "
+    "(e.g. apt install libcups2-dev; uv tool install --reinstall printer-ai-skills)"
+)
+
+_BACKEND_CACHE = None
+
+
+class _Backend:
+    """Thin holder for the platform-specific printer functions."""
+
+    def __init__(self, module, options_class):
+        self.get_printer_list = module.get_printer_list
+        self.get_printer_status = module.get_printer_status
+        self.get_printer_attrs = module.get_printer_attrs
+        self.print_file = module.print_file
+        self.get_print_jobs = module.get_print_jobs
+        self.get_print_job_status = module.get_print_job_status
+        self.cancel_print_job = module.cancel_print_job
+        self.PrintOptions = options_class
+
+
+def _unavailable(msg):
+    """Build the 501 result used when no printer backend can be loaded."""
+    return {"code": 501, "msg": msg, "data": {}}
+
+
+def _backend():
+    """Import the platform printer backend on first use.
+
+    Returns:
+        (backend, None) when the backend loaded, (None, result_dict) otherwise.
+        The result dict is a normal API response with code 501.
+    """
+    global _BACKEND_CACHE
+    if _BACKEND_CACHE is not None:
+        return _BACKEND_CACHE
+
+    if platform == "win32":
+        try:
+            from local_printer import windows as module
+            from models.model import WindowsPrintOptions as options_class
+        except ImportError as e:
+            _BACKEND_CACHE = (
+                None,
+                _unavailable(f"printer backend unavailable: {e}. {_INSTALL_HINT}"),
+            )
+            return _BACKEND_CACHE
+    elif platform in ("linux", "darwin"):
+        try:
+            from local_printer import cups as module
+            from models.model import LinuxPrintOptions as options_class
+        except ImportError as e:
+            _BACKEND_CACHE = (
+                None,
+                _unavailable(f"printer backend unavailable: {e}. {_INSTALL_HINT}"),
+            )
+            return _BACKEND_CACHE
+    else:
+        _BACKEND_CACHE = (
+            None,
+            _unavailable(
+                f"printer backend unavailable: unsupported platform '{platform}'. "
+                f"{_INSTALL_HINT}"
+            ),
+        )
+        return _BACKEND_CACHE
+
+    _BACKEND_CACHE = (_Backend(module, options_class), None)
+    return _BACKEND_CACHE
 
 
 def output_json(data):
-    """输出 JSON（便于 AI 解析）"""
+    """Print a result as JSON (easy for an AI caller to parse)."""
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
-def check_platform():
-    """检查平台是否支持"""
-    if platform not in ("win32", "linux", "darwin"):
-        print(f"❌ 不支持的操作系统: {platform}", file=sys.stderr)
-        sys.exit(1)
+def finish(result, as_json):
+    """Emit a result and exit: status 0 only when the result code is 200.
+
+    In JSON mode the whole result is printed. In human mode the caller has
+    already printed its own text, so only failures add a line (on stderr).
+    """
+    code = result.get("code") if isinstance(result, dict) else None
+    if as_json:
+        output_json(result)
+    elif code != 200:
+        msg = result.get("msg", "failed") if isinstance(result, dict) else "failed"
+        print(f"Error {code}: {msg}", file=sys.stderr)
+    sys.exit(0 if code == 200 else 1)
 
 
-# ==================== 子命令实现 ====================
+def _status_label(status):
+    """Plain-text status marker, ASCII only."""
+    return {
+        "idle": "[ok]",
+        "processing": "[busy]",
+        "stopped": "[stopped]",
+    }.get(status, "[?]")
+
+
+# ==================== printer commands ====================
 
 
 def cmd_printers(args):
-    """列出打印机"""
-    check_platform()
-    result = _get_printer_list()
+    """List printers."""
+    backend, error = _backend()
+    if error:
+        finish(error, args.json)
 
-    if args.json:
-        output_json(result)
-        return
-
-    if result.get("code") != 200:
-        print(f"❌ 获取打印机列表失败: {result.get('msg', '')}", file=sys.stderr)
-        sys.exit(1)
+    result = backend.get_printer_list()
+    if args.json or result.get("code") != 200:
+        finish(result, args.json)
 
     printers = result.get("data", {}).get("printers", [])
-    default_printer = result.get("data", {}).get("default_printer", "")
-
     if not printers:
-        print("未找到打印机")
-        return
+        print("No printers installed")
+        finish(result, args.json)
 
-    print(f"找到 {len(printers)} 台打印机:\n")
+    print(f"Found {len(printers)} printer(s):\n")
     for p in printers:
-        default_mark = " ⭐默认" if p.get("is_default") else ""
+        default_mark = " (default)" if p.get("is_default") else ""
         status = p.get("status", "unknown")
-        status_icon = {"idle": "🟢", "processing": "🟡", "stopped": "🔴"}.get(status, "⚪")
-        print(f"  [{p.get('index')}] {p.get('name', '未知')}{default_mark}")
-        print(f"      状态: {status_icon} {status}  |  型号: {p.get('model', '未知')}")
+        print(f"  [{p.get('index')}] {p.get('name', 'unknown')}{default_mark}")
+        print(
+            f"      status: {_status_label(status)} {status}  |  "
+            f"model: {p.get('model') or 'unknown'}"
+        )
         if p.get("location"):
-            print(f"      位置: {p.get('location')}")
+            print(f"      location: {p.get('location')}")
+    finish(result, args.json)
 
 
 def cmd_status(args):
-    """获取打印机状态"""
-    check_platform()
-    result = _get_printer_status(args.index)
+    """Show the status of one printer (the default printer when no index given)."""
+    backend, error = _backend()
+    if error:
+        finish(error, args.json)
 
-    if args.json:
-        output_json(result)
-        return
-
-    if result.get("code") != 200:
-        print(f"❌ 获取打印机状态失败: {result.get('msg', '')}", file=sys.stderr)
-        sys.exit(1)
+    result = backend.get_printer_status(args.index)
+    if args.json or result.get("code") != 200:
+        finish(result, args.json)
 
     data = result.get("data", {})
     status = data.get("status", "unknown")
-    status_icon = {"idle": "🟢", "processing": "🟡", "stopped": "🔴"}.get(status, "⚪")
-    print(f"打印机: {data.get('name', '未知')}")
-    print(f"状态: {status_icon} {status}")
-    print(f"接受任务: {'✅ 是' if data.get('is_accepting_jobs') else '❌ 否'}")
+    print(f"Printer: {data.get('name', 'unknown')}")
+    print(f"Status:  {_status_label(status)} {status}")
+    print(f"Accepting jobs: {'yes' if data.get('is_accepting_jobs') else 'no'}")
+    reasons = data.get("status_reasons") or []
+    if reasons:
+        print(f"Reasons: {', '.join(str(r) for r in reasons)}")
+    finish(result, args.json)
 
 
 def cmd_attrs(args):
-    """获取打印机属性"""
-    check_platform()
-    result = _get_printer_attrs(args.index)
-    output_json(result)
+    """Show printer attributes (always JSON)."""
+    backend, error = _backend()
+    if error:
+        finish(error, True)
+    finish(backend.get_printer_attrs(args.index), True)
 
 
 def cmd_print(args):
-    """打印文件"""
-    check_platform()
-    import os
+    """Print a file."""
+    backend, error = _backend()
+    if error:
+        finish(error, False)
 
     if not os.path.exists(args.file_path):
-        print(f"❌ 文件不存在: {args.file_path}", file=sys.stderr)
-        sys.exit(1)
+        finish(
+            {
+                "code": 404,
+                "msg": f"file not found: {args.file_path}",
+                "data": {"file_path": args.file_path},
+            },
+            False,
+        )
 
-    # 解析打印选项
+    # Parse print options
     print_options = None
-    if args.options and PrintOptionsClass:
+    if args.options and backend.PrintOptions:
         try:
             options_dict = json.loads(args.options)
-            print_options = PrintOptionsClass.from_dict(options_dict)
-        except json.JSONDecodeError:
-            print("❌ 打印选项 JSON 格式错误", file=sys.stderr)
-            sys.exit(1)
+            print_options = backend.PrintOptions.from_dict(options_dict)
+        except json.JSONDecodeError as e:
+            finish({"code": 400, "msg": f"invalid --options JSON: {e}", "data": {}}, False)
+        except TypeError as e:
+            finish({"code": 400, "msg": f"invalid print options: {e}", "data": {}}, False)
 
-    result = _print_file(args.index, args.file_path, print_options)
+    result = backend.print_file(args.index, args.file_path, print_options)
 
-    if result.get("code") == 200:
-        data = result.get("data", {})
-        job_id = data.get("job_id", "")
-        print(f"✅ 打印任务已提交  job_id: {job_id}")
-        print(f"   打印机: {data.get('printer_name', '')}")
-        print(f"   文件: {data.get('file_path', '')}")
-        print(f"   查询状态: printer-ai job-status {job_id}")
-    else:
-        print(f"❌ 打印失败: {result.get('msg', '')}", file=sys.stderr)
-        output_json(result)
-        sys.exit(1)
+    if result.get("code") != 200:
+        # Dump the whole result: it carries the reason and any hint
+        finish(result, True)
+
+    data = result.get("data", {})
+    job_id = data.get("job_id", "")
+    print(f"Print job submitted  job_id: {job_id}")
+    print(f"  printer: {data.get('printer_name', '')}")
+    print(f"  file:    {data.get('file_path', '')}")
+    if data.get("note"):
+        print(f"  note:    {data['note']}")
+    print(f"  check with: printer-ai job-status {job_id}")
+    finish(result, False)
 
 
 def cmd_jobs(args):
-    """列出打印任务"""
-    check_platform()
-    result = _get_print_jobs(args.printer)
+    """List print jobs."""
+    backend, error = _backend()
+    if error:
+        finish(error, args.json)
 
-    if args.json:
-        output_json(result)
-        return
-
-    if result.get("code") != 200:
-        print(f"❌ 获取打印任务失败: {result.get('msg', '')}", file=sys.stderr)
-        sys.exit(1)
+    result = backend.get_print_jobs(args.printer)
+    if args.json or result.get("code") != 200:
+        finish(result, args.json)
 
     jobs = result.get("data", {}).get("jobs", [])
     if not jobs:
-        print("没有打印任务")
-        return
+        print("No print jobs")
+        finish(result, args.json)
 
-    print(f"共 {len(jobs)} 个打印任务:\n")
+    print(f"{len(jobs)} print job(s):\n")
     for job in jobs:
         status = job.get("status", "unknown")
-        status_icon = {
-            "pending": "⏳", "processing": "🔄", "completed": "✅",
-            "canceled": "🚫", "aborted": "❌"
-        }.get(status, "⚪")
-        print(f"  [{job.get('job_id')}] {job.get('job_name', '未知')}  {status_icon} {status}")
-        print(f"      打印机: {job.get('printer_name', '')}")
+        print(f"  [{job.get('job_id')}] {job.get('job_name', 'unknown')}  - {status}")
+        print(f"      printer: {job.get('printer_name', '')}")
+    finish(result, args.json)
 
 
 def cmd_job_status(args):
-    """查询打印任务状态（同时返回打印机状态）"""
-    check_platform()
-    result = _get_print_job_status(args.job_id)
+    """Query a print job (and the state of the printer running it)."""
+    backend, error = _backend()
+    if error:
+        finish(error, True)
 
-    # 获取打印机状态并合并到结果中
+    result = backend.get_print_job_status(args.job_id)
+
+    # Merge in the printer status when we know which queue owns the job
     printer_name = result.get("data", {}).get("printer_name", "")
     if printer_name and result.get("code") == 200:
-        # 从打印机列表中找到对应打印机的 index
-        printer_list_result = _get_printer_list()
+        printer_list_result = backend.get_printer_list()
         if printer_list_result.get("code") == 200:
             for p in printer_list_result["data"].get("printers", []):
                 if p.get("name") == printer_name:
-                    status_result = _get_printer_status(p["index"])
+                    status_result = backend.get_printer_status(p["index"])
                     if status_result.get("code") == 200:
                         result["data"]["printer_status"] = status_result["data"]
                     break
 
-    output_json(result)
+    finish(result, True)
 
 
 def cmd_cancel_job(args):
-    """取消打印任务"""
-    check_platform()
-    result = _cancel_print_job(args.job_id)
-    output_json(result)
-    if result.get("code") == 200:
-        print("✅ 打印任务已取消")
+    """Cancel a print job."""
+    backend, error = _backend()
+    if error:
+        finish(error, True)
+    finish(backend.cancel_print_job(args.job_id), True)
 
 
-# ==================== 网络发现 / 安装命令 ====================
+# ==================== network discovery / install commands ====================
+#
+# The network commands live in local_printer.commands_net, which owns its own
+# handlers (cmd_discover, cmd_setup, ...) and the same "exit 0 only on code 200"
+# rule. main.py just parses the arguments and hands them over; the local
+# implementations below are used only when that module has no handler for a
+# command, so the CLI keeps working either way.
 
 
-def _fail(result):
-    """Print the error of a failed APIResponse and exit."""
-    print(f"❌ {result.get('msg', 'failed')}", file=sys.stderr)
-    sys.exit(1)
+def _run_net_command(name, args, fallback):
+    """Dispatch a network subcommand to commands_net, else to the fallback."""
+    from local_printer import commands_net
+
+    handler = getattr(commands_net, f"cmd_{name}", None)
+    if handler is None:
+        return fallback(args)
+    result = handler(args)
+    # These handlers normally exit by themselves; honour a returned result too.
+    if isinstance(result, dict):
+        finish(result, getattr(args, "json", False))
+    sys.exit(0)
+
+
+def _net(name, fallback):
+    """Build the argparse callback for a network subcommand."""
+
+    def runner(args):
+        return _run_net_command(name, args, fallback)
+
+    runner.__name__ = f"cmd_{name}"
+    return runner
 
 
 def cmd_discover(args):
-    """扫描局域网中的打印机 - scan the LAN for printers"""
+    """Scan the LAN for printers."""
     from local_printer import commands_net
 
-    result = commands_net.discover(subnet=args.subnet, timeout=args.timeout, deep=not args.fast)
-    if args.json:
-        output_json(result)
-        return
-    if result.get("code") != 200:
-        _fail(result)
+    extra = {}
+    if getattr(args, "force", False):
+        extra["force"] = True
+    result = commands_net.discover(
+        subnet=args.subnet, timeout=args.timeout, deep=not args.fast, **extra
+    )
+    if args.json or result.get("code") != 200:
+        finish(result, args.json)
 
     data = result["data"]
     printers = data["printers"]
-    print(f"扫描 {data['subnet']} - 找到 {data['count']} 台打印机\n")
+    print(f"Scanned {data['subnet']} - found {data['count']} printer(s)\n")
     for entry in printers:
         ipp = entry.get("ipp") or {}
-        model = ipp.get("make_and_model") or entry.get("vendor_hint") or "unbekanntes Modell"
+        model = ipp.get("make_and_model") or entry.get("vendor_hint") or "unknown model"
         state = ipp.get("state")
-        icon = {"idle": "🟢", "processing": "🟡", "stopped": "🔴"}.get(state, "⚪")
-        print(f"  {entry['host']}  {icon} {model}")
-        print(f"      Ports: {', '.join(entry['open_ports'])}")
+        print(f"  {entry['host']}  {_status_label(state)} {model}")
+        print(f"      ports: {', '.join(entry['open_ports'])}")
         if entry.get("mac"):
-            print(f"      MAC:   {entry['mac']}")
+            print(f"      mac:   {entry['mac']}")
         if ipp.get("supports_duplex") is not None:
-            duplex = "ja" if ipp["supports_duplex"] else "nein"
-            print(f"      Duplex: {duplex}  |  Standardmedium: {ipp.get('media_default', '?')}")
+            duplex = "yes" if ipp["supports_duplex"] else "no"
+            print(
+                f"      duplex: {duplex}  |  default media: "
+                f"{ipp.get('media_default', '?')}"
+            )
     if not printers:
-        print("  (keine gefunden - ggf. --subnet angeben)")
+        print("  (none found - try --subnet)")
+    finish(result, args.json)
 
 
 def cmd_probe(args):
-    """探测单个主机 - probe one host"""
+    """Probe one host."""
     from local_printer import commands_net
 
-    result = commands_net.probe(args.host, timeout=args.timeout)
-    output_json(result)
+    finish(commands_net.probe(args.host, timeout=args.timeout), True)
 
 
 def cmd_diagnose(args):
-    """核对已安装打印机是否真的在线 - verify installed printers against the network"""
+    """Verify installed printers against the network."""
     from local_printer import commands_net
 
     result = commands_net.diagnose(deep=not args.fast, timeout=args.timeout)
-    if args.json:
-        output_json(result)
-        return
-    if result.get("code") != 200:
-        _fail(result)
+    if args.json or result.get("code") != 200:
+        finish(result, args.json)
 
     data = result["data"]
-    print(f"{data['count']} 台打印机: {data['online']} 在线, {data['offline']} 离线\n")
+    print(
+        f"{data['count']} printer(s): {data['online']} online, "
+        f"{data['offline']} offline, {data.get('unknown', 0)} unknown\n"
+    )
     for entry in data["printers"]:
-        icon = "🟢" if entry["really_online"] else "🔴"
-        default = " ⭐" if entry.get("is_default") else ""
+        online = entry.get("really_online")
+        mark = "[unknown]" if online is None else ("[online]" if online else "[offline]")
+        default = " (default)" if entry.get("is_default") else ""
         print(f"  [{entry['index']}] {entry['name']}{default}")
-        print(f"      Spooler: {entry['spooler_status']}  |  {icon} {entry['verdict']}")
+        print(f"      spooler: {entry['spooler_status']}  |  {mark} {entry['verdict']}")
         if entry.get("model"):
-            print(f"      Geraet:  {entry['model']} ({entry.get('device_state', '?')})")
+            print(f"      device:  {entry['model']} ({entry.get('device_state', '?')})")
+    finish(result, args.json)
 
 
 def cmd_ports(args):
+    """List printer ports (always JSON)."""
     from local_printer import commands_net
 
-    output_json(commands_net.ports())
+    finish(commands_net.ports(), True)
 
 
 def cmd_drivers(args):
+    """List installed printer drivers (always JSON)."""
     from local_printer import commands_net
 
-    output_json(commands_net.drivers(model=args.model))
+    finish(commands_net.drivers(model=args.model), True)
 
 
 def cmd_setup(args):
-    """安装网络打印机（优先完整驱动） - install a network printer, best driver first"""
+    """Install a network printer, best driver first."""
     from local_printer import commands_net
 
+    extra = {}
+    if getattr(args, "vendor_lookup", False):
+        extra["vendor_lookup"] = True
     result = commands_net.setup(
-        args.host, name=args.name, dry_run=args.dry_run, allow_generic=not args.no_generic
+        args.host,
+        name=args.name,
+        dry_run=args.dry_run,
+        allow_generic=not args.no_generic,
+        **extra,
     )
-    if args.json or args.dry_run:
-        output_json(result)
-        return
-    if result.get("code") != 200:
-        output_json(result)
-        _fail(result)
+    if args.json or args.dry_run or result.get("code") != 200:
+        finish(result, True)
 
     data = result["data"]
     strategy = data.get("installed_with") or {}
-    print(f"✅ Drucker eingerichtet: {data.get('printer')}")
-    print(f"   Methode: {strategy.get('kind')}  |  Treiber: {strategy.get('driver')}")
-    print(f"   Port:    {strategy.get('port')}")
+    print(f"Printer installed: {data.get('printer')}")
+    print(f"  method: {strategy.get('kind')}  |  driver: {strategy.get('driver')}")
+    print(f"  port:   {strategy.get('port')}")
 
     verification = data.get("verification") or {}
     if verification.get("full_featured"):
-        print("   ✅ Alle Geraetefunktionen verfuegbar")
+        print("  all device features available")
     else:
-        print("   ⚠️  Eingeschraenkte Funktionen:")
+        print("  limited features:")
         for item in verification.get("missing", []):
-            print(f"      - {item}")
+            print(f"    - {item}")
     if data.get("hint"):
-        print(f"   💡 {data['hint']}")
+        print(f"  hint: {data['hint']}")
+    finish(result, False)
 
 
 def cmd_driver_search(args):
-    """在厂商网站上查找驱动 - look up a manufacturer driver online"""
+    """Look up a manufacturer driver online."""
     from local_printer import commands_net
 
     result = commands_net.driver_search(
         model=args.model, host=args.host, region=args.region,
         os_code=args.os, download_dir=args.download, open_browser=args.open,
     )
-    if args.json:
-        output_json(result)
-        return
-    if result.get("code") != 200:
-        _fail(result)
+    if args.json or result.get("code") != 200:
+        finish(result, args.json)
 
     data = result["data"]
-    print(f"Modell:  {data['model']}")
-    print(f"Hersteller: {data['vendor']}  |  Region: {data.get('region')}  |  "
-          f"OS: {data['os']['release']} {data['os']['arch']}")
+    print(f"Model:  {data['model']}")
+    print(f"Vendor: {data['vendor']}  |  region: {data.get('region')}  |  "
+          f"os: {data['os']['release']} {data['os']['arch']}")
 
     if not data.get("supported"):
-        print(f"\n⚠️  {data.get('hint', '')}")
+        print(f"\nWarning: {data.get('hint', '')}")
         if data.get("support_site"):
-            print(f"   Support-Seite (ungeprueft): {data['support_site']}")
-        return
+            print(f"  support site (unverified): {data['support_site']}")
+        finish(result, args.json)
 
     downloads = data.get("downloads") or []
     if downloads:
-        print(f"\n✅ {len(downloads)} Treiberpaket(e) gefunden:\n")
+        print(f"\n{len(downloads)} driver package(s) found:\n")
         for item in downloads:
             size = f"{item['size_mb']} MB" if item.get("size_mb") else "?"
             print(f"  [{item['category']}] v{item['version']}  ({size})")
             print(f"      {item['filename']}")
             print(f"      {item['url']}")
     else:
-        print(f"\n⚠️  {data.get('note', 'Keine direkten Download-Links verfuegbar.')}")
-    print(f"\n🔗 Download-Seite: {data['download_page']}")
+        print(f"\nWarning: {data.get('note', 'No direct download links available.')}")
+    print(f"\nDownload page: {data['download_page']}")
 
     dl = data.get("download")
     if dl:
         if dl.get("ok"):
-            print(f"\n⬇️  Gespeichert: {dl['path']}")
-            print(f"   {dl['size_bytes']} Bytes  |  SHA-256 {dl['sha256']}")
-            print(f"   {dl['note']}")
+            print(f"\nSaved: {dl['path']}")
+            print(f"  {dl['size_bytes']} bytes  |  SHA-256 {dl['sha256']}")
+            print(f"  {dl['note']}")
         elif dl.get("blocked"):
-            print(f"\n🚫 {dl.get('error')}")
-            print("   Der Hersteller liefert die Datei nur an echte Browser-Sessions aus.")
-            print(f"   Im Browser oeffnen:  printer-ai driver-search {_echo_args(args)} --open")
+            print(f"\nBlocked: {dl.get('error')}")
+            print("  The vendor only serves this file to real browser sessions.")
+            print(f"  Open it in a browser: printer-ai driver-search {_echo_args(args)} --open")
         else:
-            print(f"\n❌ Download fehlgeschlagen: {dl.get('error')}")
+            print(f"\nDownload failed: {dl.get('error')}")
 
     opened = data.get("opened")
     if opened:
         if opened.get("ok"):
-            print(f"\n🌐 Im Browser geoeffnet: {opened['url']}")
-            print("   Der Download laeuft dort. Danach: printer-ai setup <IP> --no-generic")
+            print(f"\nOpened in the browser: {opened['url']}")
+            print("  Finish the download there, then: printer-ai setup <IP> --no-generic")
         else:
-            print(f"\n❌ Konnte den Browser nicht oeffnen: {opened.get('error')}")
+            print(f"\nCould not open a browser: {opened.get('error')}")
+    finish(result, args.json)
 
 
 def _echo_args(args):
@@ -400,136 +500,173 @@ def _echo_args(args):
 
 
 def cmd_remove(args):
+    """Delete a printer queue (always JSON)."""
     from local_printer import commands_net
 
     if not args.yes:
-        print("❌ Refusing to remove a printer without --yes", file=sys.stderr)
-        sys.exit(1)
-    output_json(commands_net.remove(args.name))
+        finish(
+            {"code": 400, "msg": "refusing to remove a printer without --yes", "data": {}},
+            True,
+        )
+    finish(commands_net.remove(args.name), True)
 
 
 def cmd_set_default(args):
+    """Set the default printer (always JSON)."""
     from local_printer import commands_net
 
-    output_json(commands_net.set_default(args.name))
+    finish(commands_net.set_default(args.name), True)
 
 
-# ==================== 主入口 ====================
+# ==================== entry point ====================
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(
         prog="printer-ai",
-        description="跨平台本地打印机 CLI - 让 AI 驱动本地打印",
+        description="Cross-platform local printer CLI - let an AI drive local printing",
     )
-    subparsers = parser.add_subparsers(dest="command", help="可用命令")
+    subparsers = parser.add_subparsers(dest="command", help="available commands")
 
     # printers
-    p_printers = subparsers.add_parser("printers", help="列出打印机")
-    p_printers.add_argument("--json", action="store_true", help="JSON 格式输出")
+    p_printers = subparsers.add_parser("printers", help="list installed printers")
+    p_printers.add_argument("--json", action="store_true", help="output JSON")
     p_printers.set_defaults(func=cmd_printers)
 
     # status
-    p_status = subparsers.add_parser("status", help="获取打印机状态")
+    p_status = subparsers.add_parser("status", help="show printer status")
     p_status.add_argument("index", type=int, nargs="?", default=None,
-                          help="打印机索引 (从1开始，默认: 默认打印机)")
-    p_status.add_argument("--json", action="store_true", help="JSON 格式输出")
+                          help="printer index (1-based; default: the default printer)")
+    p_status.add_argument("--json", action="store_true", help="output JSON")
     p_status.set_defaults(func=cmd_status)
 
     # attrs
-    p_attrs = subparsers.add_parser("attrs", help="获取打印机属性")
+    p_attrs = subparsers.add_parser("attrs", help="show printer attributes as JSON")
     p_attrs.add_argument("index", type=int, nargs="?", default=None,
-                         help="打印机索引 (从1开始)")
+                         help="printer index (1-based; default: the default printer)")
     p_attrs.set_defaults(func=cmd_attrs)
 
     # print
-    p_print = subparsers.add_parser("print", help="打印文件")
-    p_print.add_argument("file_path", help="要打印的文件路径")
+    p_print = subparsers.add_parser("print", help="print a file")
+    p_print.add_argument("file_path", help="path of the file to print")
     p_print.add_argument("--index", type=int, default=None,
-                         help="打印机索引 (从1开始，默认: 默认打印机)")
-    p_print.add_argument("--options", help="打印选项 (JSON 格式字符串)")
+                         help="printer index (1-based; default: the default printer)")
+    p_print.add_argument("--options", help="print options as a JSON string")
     p_print.set_defaults(func=cmd_print)
 
     # jobs
-    p_jobs = subparsers.add_parser("jobs", help="列出打印任务")
-    p_jobs.add_argument("--printer", default=None, help="筛选指定打印机名称")
-    p_jobs.add_argument("--json", action="store_true", help="JSON 格式输出")
+    p_jobs = subparsers.add_parser("jobs", help="list print jobs")
+    p_jobs.add_argument("--printer", default=None, help="only jobs of this printer name")
+    p_jobs.add_argument("--json", action="store_true", help="output JSON")
     p_jobs.set_defaults(func=cmd_jobs)
 
     # job-status
-    p_js = subparsers.add_parser("job-status", help="查询打印任务状态")
-    p_js.add_argument("job_id", type=int, help="任务 ID")
+    p_js = subparsers.add_parser("job-status", help="query one print job")
+    p_js.add_argument("job_id", type=int, help="job id")
     p_js.set_defaults(func=cmd_job_status)
 
     # cancel-job
-    p_cj = subparsers.add_parser("cancel-job", help="取消打印任务")
-    p_cj.add_argument("job_id", type=int, help="任务 ID")
+    p_cj = subparsers.add_parser("cancel-job", help="cancel a print job")
+    p_cj.add_argument("job_id", type=int, help="job id")
     p_cj.set_defaults(func=cmd_cancel_job)
 
     # discover
-    p_disc = subparsers.add_parser("discover", help="扫描局域网中的打印机")
-    p_disc.add_argument("--subnet", default=None, help="要扫描的 /24 网段，如 192.168.1")
-    p_disc.add_argument("--timeout", type=float, default=0.6, help="每个端口的超时秒数")
-    p_disc.add_argument("--fast", action="store_true", help="跳过 IPP 身份查询")
-    p_disc.add_argument("--json", action="store_true", help="JSON 格式输出")
-    p_disc.set_defaults(func=cmd_discover)
+    p_disc = subparsers.add_parser("discover", help="scan the local network for printers")
+    p_disc.add_argument("--subnet", default=None,
+                        help="the /24 subnet to scan, e.g. 192.168.1")
+    p_disc.add_argument("--timeout", type=float, default=0.6,
+                        help="per-port timeout in seconds")
+    p_disc.add_argument("--fast", action="store_true", help="skip the IPP identity query")
+    p_disc.add_argument("--force", action="store_true",
+                        help="allow scanning a subnet that is not one of this machine's "
+                             "own /24 networks")
+    p_disc.add_argument("--json", action="store_true", help="output JSON")
+    p_disc.set_defaults(func=_net("discover", cmd_discover))
 
     # probe
-    p_probe = subparsers.add_parser("probe", help="探测单个主机是否为打印机")
-    p_probe.add_argument("host", help="IP 地址")
-    p_probe.add_argument("--timeout", type=float, default=1.0, help="超时秒数")
-    p_probe.set_defaults(func=cmd_probe)
+    p_probe = subparsers.add_parser("probe", help="check whether one host is a printer")
+    p_probe.add_argument("host", help="IP address")
+    p_probe.add_argument("--timeout", type=float, default=1.0, help="timeout in seconds")
+    p_probe.set_defaults(func=_net("probe", cmd_probe))
 
     # diagnose
-    p_diag = subparsers.add_parser("diagnose", help="核对已安装打印机是否真的在线")
-    p_diag.add_argument("--timeout", type=float, default=1.0, help="超时秒数")
-    p_diag.add_argument("--fast", action="store_true", help="跳过 IPP 身份查询")
-    p_diag.add_argument("--json", action="store_true", help="JSON 格式输出")
-    p_diag.set_defaults(func=cmd_diagnose)
+    p_diag = subparsers.add_parser(
+        "diagnose", help="check whether installed printers are really online")
+    p_diag.add_argument("--timeout", type=float, default=1.0, help="timeout in seconds")
+    p_diag.add_argument("--fast", action="store_true", help="skip the IPP identity query")
+    p_diag.add_argument("--json", action="store_true", help="output JSON")
+    p_diag.set_defaults(func=_net("diagnose", cmd_diagnose))
 
     # ports
-    p_ports = subparsers.add_parser("ports", help="列出打印机端口")
-    p_ports.set_defaults(func=cmd_ports)
+    p_ports = subparsers.add_parser("ports", help="list printer ports")
+    p_ports.set_defaults(func=_net("ports", cmd_ports))
 
     # drivers
-    p_drv = subparsers.add_parser("drivers", help="列出打印机驱动")
-    p_drv.add_argument("--model", default=None, help="按型号匹配候选驱动")
-    p_drv.set_defaults(func=cmd_drivers)
+    p_drv = subparsers.add_parser("drivers", help="list installed printer drivers")
+    p_drv.add_argument("--model", default=None, help="match candidate drivers for a model")
+    p_drv.set_defaults(func=_net("drivers", cmd_drivers))
 
     # setup
-    p_setup = subparsers.add_parser("setup", help="安装网络打印机（优先完整驱动）")
-    p_setup.add_argument("host", help="打印机 IP 地址")
-    p_setup.add_argument("--name", default=None, help="队列名称（默认使用设备型号）")
-    p_setup.add_argument("--dry-run", action="store_true", help="只显示计划，不做更改")
+    p_setup = subparsers.add_parser(
+        "setup", help="install a network printer, best driver first")
+    p_setup.add_argument("host", help="printer IP address")
+    p_setup.add_argument("--name", default=None,
+                         help="queue name (default: the device model)")
+    p_setup.add_argument("--dry-run", action="store_true",
+                         help="only show the plan, change nothing")
     p_setup.add_argument("--no-generic", action="store_true",
-                         help="拒绝通用驱动回退（宁可失败也不降级）")
-    p_setup.add_argument("--json", action="store_true", help="JSON 格式输出")
-    p_setup.set_defaults(func=cmd_setup)
+                         help="refuse the generic driver fallback (fail instead)")
+    p_setup.add_argument("--vendor-lookup", action="store_true",
+                         help="query the manufacturer's download portal for a driver "
+                              "(sends model/OS/region to the vendor)")
+    p_setup.add_argument("--json", action="store_true", help="output JSON")
+    p_setup.set_defaults(func=_net("setup", cmd_setup))
 
     # driver-search
-    p_ds = subparsers.add_parser("driver-search", help="在厂商网站上查找驱动")
-    p_ds.add_argument("model", nargs="?", default=None, help="打印机型号，如 'EPSON ET-4850 Series'")
-    p_ds.add_argument("--host", default=None, help="改为通过 IPP 从该 IP 读取型号")
-    p_ds.add_argument("--region", default=None, help="两位区域代码，如 DE / US（默认: 系统区域）")
-    p_ds.add_argument("--os", default=None, help="厂商 OS 代码（默认: 自动检测）")
+    p_ds = subparsers.add_parser(
+        "driver-search", help="look up a driver on the manufacturer's site")
+    p_ds.add_argument("model", nargs="?", default=None,
+                      help="printer model, e.g. 'EPSON ET-4850 Series'")
+    p_ds.add_argument("--host", default=None,
+                      help="read the model from this IP over IPP instead")
+    p_ds.add_argument("--region", default=None,
+                      help="two-letter region code, e.g. DE / US (default: system region)")
+    p_ds.add_argument("--os", default=None,
+                      help="vendor OS code (default: auto-detected)")
     p_ds.add_argument("--download", default=None, metavar="DIR",
-                      help="下载安装包到该目录（仅下载并校验，绝不执行）")
+                      help="download the installer into this directory "
+                           "(downloads and checksums only, never executes)")
     p_ds.add_argument("--open", action="store_true",
-                      help="在默认浏览器中打开下载链接（厂商拒绝脚本下载时使用）")
-    p_ds.add_argument("--json", action="store_true", help="JSON 格式输出")
-    p_ds.set_defaults(func=cmd_driver_search)
+                      help="open the download link in the default browser "
+                           "(for vendors that refuse scripted downloads)")
+    p_ds.add_argument("--json", action="store_true", help="output JSON")
+    p_ds.set_defaults(func=_net("driver_search", cmd_driver_search))
 
     # remove
-    p_rm = subparsers.add_parser("remove", help="删除打印机队列")
-    p_rm.add_argument("name", help="打印机名称")
-    p_rm.add_argument("--yes", action="store_true", help="确认删除")
-    p_rm.set_defaults(func=cmd_remove)
+    p_rm = subparsers.add_parser("remove", help="delete a printer queue")
+    p_rm.add_argument("name", help="printer name")
+    p_rm.add_argument("--yes", action="store_true", help="confirm the deletion")
+    p_rm.set_defaults(func=_net("remove", cmd_remove))
 
     # set-default
-    p_sd = subparsers.add_parser("set-default", help="设置默认打印机")
-    p_sd.add_argument("name", help="打印机名称")
-    p_sd.set_defaults(func=cmd_set_default)
+    p_sd = subparsers.add_parser("set-default", help="set the default printer")
+    p_sd.add_argument("name", help="printer name")
+    p_sd.set_defaults(func=_net("set_default", cmd_set_default))
 
+    return parser
+
+
+def main():
+    # Console code pages differ wildly across the machines this ships to;
+    # never let an unencodable character turn into a crash.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+    parser = build_parser()
     args = parser.parse_args()
 
     if not args.command:
@@ -538,8 +675,13 @@ def main():
 
     try:
         args.func(args)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("Aborted", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        print(f"❌ 错误: {e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
 

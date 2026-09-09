@@ -9,6 +9,9 @@
   the port, exports the key to a .reg backup, stops the spooler, deletes the key and starts
   the spooler again.
 
+  WARNING: stopping the Print Spooler aborts every print job in flight, for all users on this
+  machine, not just jobs of the port being purged. Run it when nothing is printing.
+
   Must run elevated.
 
 .PARAMETER Port
@@ -29,8 +32,22 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$result = [ordered]@{ port = $Port; ok = $false }
+$result = [ordered]@{
+    port = $Port
+    ok = $false
+    warning = 'restarting the Print Spooler aborts all in-flight print jobs, of every user on this machine'
+}
 function Fail($msg) { $result.error = $msg; $result | ConvertTo-Json; exit 1 }
+
+# reg.exe writes progress to stderr; under $ErrorActionPreference='Stop' a redirected native
+# stderr becomes a terminating error, which would kill the script after the spooler is already
+# stopped and before any JSON is emitted. Run the native calls with errors non-terminating.
+function Invoke-Reg([string[]] $RegArgs) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $out = & reg.exe @RegArgs 2>&1 | Out-String } finally { $ErrorActionPreference = $prev }
+    return @{ output = $out.Trim(); code = $LASTEXITCODE }
+}
 
 if (-not $Yes) { Fail 'refusing without -Yes' }
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -43,15 +60,18 @@ $key = "HKLM\SYSTEM\CurrentControlSet\Control\Print\Monitors\WSD Port\Ports\$Por
 if (-not (Test-Path "Registry::$key")) { Fail "registry key not found: $key" }
 
 $backup = Join-Path $BackupDir ("$Port-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.reg')
-& reg.exe export "$key" "$backup" /y | Out-Null
-if (-not (Test-Path $backup)) { Fail 'registry export failed, nothing changed' }
+$export = Invoke-Reg @('export', $key, $backup, '/y')
+if (-not (Test-Path $backup)) {
+    Fail ('registry export failed, nothing changed: ' + $export.output)
+}
 $result.backup = $backup
 
 Stop-Service Spooler -Force
 Start-Sleep -Seconds 3
 try {
-    $out = & reg.exe delete "$key" /f 2>&1
-    $result.reg_delete = [string]$out
+    $del = Invoke-Reg @('delete', $key, '/f')
+    $result.reg_delete = $del.output
+    $result.reg_delete_code = $del.code
 } finally {
     Start-Service Spooler
     Start-Sleep -Seconds 5
