@@ -155,6 +155,13 @@ and agents can branch on the exit status alone.
 
 `SKILL.md` explains when to use which, and the Windows pitfalls (TLS-only IPP printers, orphaned WSD ports, the Device Association Service) that the scripts work around.
 
+## Development
+
+```
+uv sync --group dev
+uv run pytest
+```
+
 ## Security notes
 
 - Printer names and hosts are passed to PowerShell as literals — they are never
