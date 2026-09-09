@@ -537,7 +537,14 @@ def verify_capabilities(printer_name: str, identity: Optional[Dict[str, Any]]) -
             "sources": identity.get("media_sources") if identity else None,
         },
         "missing": missing,
-        "full_featured": not missing,
+        # Without the device's own answer there is nothing to compare against:
+        # an empty `missing` then means "unknown", not "nothing lost", and
+        # claiming the latter would hide a real downgrade.
+        "comparable": bool(identity),
+        "full_featured": (not missing) if identity else None,
+        "note": None if identity else
+        "the device did not answer IPP, so the queue's capabilities could not "
+        "be compared against it",
     }
 
 
@@ -775,8 +782,12 @@ def setup_printer(
             "verification": verification,
             "identity": identity,
             "elevated": is_elevated(),
-            "warning": None if verification["full_featured"] else
-            "Printer installed but with reduced capabilities -- see verification.missing",
+            "warning": None if verification["full_featured"] else (
+                "Printer installed, but its capabilities could not be compared "
+                "against the device -- see verification.note"
+                if verification["full_featured"] is None else
+                "Printer installed but with reduced capabilities -- see verification.missing"
+            ),
         }
 
     failure = {

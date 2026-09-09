@@ -197,6 +197,13 @@ def _ipp_parse_response(data: bytes) -> Dict[str, Any]:
         elif tag == _BOOL_TAG and val_len == 1:
             value = bool(raw[0])
         else:
+            # A value type we do not decode (resolution, dateTime, ...). Its
+            # *additional* values follow with a zero-length name, so forget the
+            # attribute we were collecting: appending them to that one would
+            # silently corrupt it (printer-resolution-supported landing in
+            # whatever text attribute happened to come before it).
+            if name:
+                current = None
             continue
 
         if name:  # a new attribute
@@ -208,6 +215,10 @@ def _ipp_parse_response(data: bytes) -> Dict[str, Any]:
                 existing.append(value)
             else:
                 attrs[current] = [existing, value]
+        else:
+            # Additional value with nothing to attach it to: either malformed,
+            # or a continuation of an attribute whose type we skipped above.
+            logger.debug(f"IPP: dropping orphan additional value {value!r}")
     return attrs
 
 

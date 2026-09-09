@@ -48,6 +48,8 @@ VENDOR_KEYWORDS = {
     "epson": "Epson",
     "seiko epson": "Epson",
     "hp": "HP",
+    "hewlett packard": "HP",
+    "hewlett-packard": "HP",
     "hewlett": "HP",
     "brother": "Brother",
     "canon": "Canon",
@@ -183,29 +185,54 @@ def epson_os_code() -> Optional[str]:
 # ---------------------------------------------------------------- model
 
 
+# Brand and model are not always separated by a space: "Brother-MFC-L2750DW"
+# and "Canon:LBP2900" are both real IPP make-and-model strings.
+_BRAND_SEPARATORS = " -_:/,"
+
+
 def split_model(make_and_model: str) -> Dict[str, str]:
-    """Split 'EPSON ET-4850 Series' into vendor and portal device id."""
+    """Split 'EPSON ET-4850 Series' into vendor and portal device id.
+
+    `device_id` is what goes into a vendor portal query, so the brand has to
+    come off whatever separator it was attached with -- leaving "Brother" in
+    "Brother-MFC-L2750DW" would search the portal for the wrong string.
+    Keywords are tried longest-first so "seiko epson" wins over "epson".
+    """
     text = (make_and_model or "").strip()
     low = text.lower()
+    keywords = sorted(VENDOR_KEYWORDS, key=len, reverse=True)
+
     vendor = ""
-    for keyword, name in VENDOR_KEYWORDS.items():
-        if low.startswith(keyword + " ") or low == keyword:
-            vendor = name
+    matched = ""
+    for keyword in keywords:
+        if low == keyword:
+            vendor, matched = VENDOR_KEYWORDS[keyword], keyword
+            break
+        if low.startswith(keyword) and low[len(keyword)] in _BRAND_SEPARATORS:
+            vendor, matched = VENDOR_KEYWORDS[keyword], keyword
             break
     if not vendor:
-        for keyword, name in VENDOR_KEYWORDS.items():
-            if keyword in low:
-                vendor = name
+        # Brand somewhere inside the string, but only as a whole word: without
+        # the boundary "Alphaprint" would be read as an HP device.
+        for keyword in keywords:
+            if re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", low):
+                vendor, matched = VENDOR_KEYWORDS[keyword], keyword
                 break
 
     device_id = text
-    if vendor:
-        # Strip the leading brand word(s); portals index the bare model.
-        for keyword in sorted(VENDOR_KEYWORDS, key=len, reverse=True):
-            if low.startswith(keyword + " "):
-                device_id = text[len(keyword):].strip()
-                break
-    return {"vendor": vendor, "device_id": device_id, "model": text}
+    if matched:
+        if low.startswith(matched):
+            device_id = text[len(matched):].lstrip(_BRAND_SEPARATORS).strip()
+        else:
+            device_id = re.sub(
+                rf"(?<![a-z0-9]){re.escape(matched)}(?![a-z0-9])",
+                " ",
+                text,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            device_id = " ".join(device_id.split())
+    return {"vendor": vendor, "device_id": device_id or text, "model": text}
 
 
 # ------------------------------------------------------------- Epson API

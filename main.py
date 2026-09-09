@@ -426,6 +426,8 @@ def cmd_setup(args):
     verification = data.get("verification") or {}
     if verification.get("full_featured"):
         print("  all device features available")
+    elif verification.get("full_featured") is None:
+        print(f"  features unverified: {verification.get('note', 'no device answer')}")
     else:
         print("  limited features:")
         for item in verification.get("missing", []):

@@ -418,3 +418,57 @@ def test_ps_strips_preamble_and_category_info(monkeypatch):
     ok, out, err = sw._ps("whatever")
     assert ok is False
     assert err == "no such printer: X"
+
+
+# ------------------------------------------------- verify_capabilities honesty
+
+
+def _fake_caps(monkeypatch, caps):
+    """verify_capabilities imports get_capabilities from local_printer.windows."""
+    import local_printer.windows as win
+
+    monkeypatch.setattr(win, "get_capabilities", lambda name: caps)
+
+
+def test_verify_capabilities_without_identity_is_not_full_featured(monkeypatch):
+    # No IPP answer means nothing to compare against: an empty `missing` list
+    # must not be reported as "everything is available".
+    _fake_caps(monkeypatch, {"Duplex": {"Off": 1}, "Papers": {"A4": 9}})
+    result = sw.verify_capabilities("Some Queue", None)
+    assert result["comparable"] is False
+    assert result["full_featured"] is None
+    assert result["missing"] == []
+    assert result["note"]
+    assert result["device_capabilities"]["duplex"] is None
+
+
+def test_verify_capabilities_with_identity_reports_losses(monkeypatch):
+    _fake_caps(monkeypatch, {"Duplex": {"Off": 1}, "Papers": {"A4": 9}, "Bins": {}, "MediaTypes": {}})
+    identity = {
+        "supports_duplex": True,
+        "media_types": ["stationery", "photographic"],
+        "media_sources": ["main"],
+    }
+    result = sw.verify_capabilities("Some Queue", identity)
+    assert result["comparable"] is True
+    assert result["full_featured"] is False
+    assert result["note"] is None
+    assert any("duplex" in m for m in result["missing"])
+
+
+def test_verify_capabilities_full_match_is_full_featured(monkeypatch):
+    _fake_caps(
+        monkeypatch,
+        {
+            "Duplex": {"Off": 1, "Long Edge": 2},
+            "Papers": {"A4": 9},
+            "Bins": {"Main tray": 257},
+            "MediaTypes": {"Plain": 1},
+            "Color": {"Black": 1, "Color": 2},
+        },
+    )
+    identity = {"supports_duplex": True, "media_types": ["stationery"], "media_sources": ["main"]}
+    result = sw.verify_capabilities("Some Queue", identity)
+    assert result["comparable"] is True
+    assert result["full_featured"] is True
+    assert result["missing"] == []

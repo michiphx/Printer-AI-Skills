@@ -399,3 +399,53 @@ class TestScanSubnet:
         monkeypatch.setattr(discovery, "ThreadPoolExecutor", _SpyExecutor)
         discovery.scan_subnet(subnet="192.168.1", workers=500, force=True)
         assert _SpyExecutor.instances[-1].max_workers == discovery.MAX_SCAN_WORKERS
+
+
+# --------------------------------------- undecodable attribute values
+
+
+def _ipp_attr_bytes(tag, name, value):
+    return struct.pack(">BH", tag, len(name)) + name + struct.pack(">H", len(value)) + value
+
+
+def _ipp_body(*attrs):
+    body = struct.pack(">HHI", 0x0200, 0x0000, 1) + b"\x01"
+    for chunk in attrs:
+        body += chunk
+    return body + b"\x03"
+
+
+def test_undecodable_attribute_values_do_not_join_the_previous_attribute():
+    # tag 0x32 is `resolution`, which this parser does not decode. Its extra
+    # values arrive with a zero-length name; appending them to the text
+    # attribute before it would corrupt the model string.
+    body = _ipp_body(
+        _ipp_attr_bytes(0x42, b"printer-make-and-model", b"EPSON ET-4850 Series"),
+        _ipp_attr_bytes(0x32, b"printer-resolution-supported", b"\x00\x00\x01,\x00\x00\x01,\x03"),
+        _ipp_attr_bytes(0x32, b"", b"\x00\x00\x02X\x00\x00\x02X\x03"),
+        _ipp_attr_bytes(0x23, b"printer-state", struct.pack(">i", 3)),
+    )
+    parsed = discovery._ipp_parse_response(body)
+    assert parsed["printer-make-and-model"] == "EPSON ET-4850 Series"
+    assert parsed["printer-state"] == 3
+    assert "printer-resolution-supported" not in parsed
+
+
+def test_multi_value_attributes_still_collect():
+    body = _ipp_body(
+        _ipp_attr_bytes(0x44, b"media-supported", b"iso_a4_210x297mm"),
+        _ipp_attr_bytes(0x44, b"", b"na_letter_8.5x11in"),
+        _ipp_attr_bytes(0x44, b"", b"iso_a5_148x210mm"),
+    )
+    parsed = discovery._ipp_parse_response(body)
+    assert parsed["media-supported"] == [
+        "iso_a4_210x297mm",
+        "na_letter_8.5x11in",
+        "iso_a5_148x210mm",
+    ]
+
+
+def test_orphan_additional_value_is_dropped_not_crashed():
+    # A continuation value with no named attribute before it (malformed device).
+    body = _ipp_body(_ipp_attr_bytes(0x44, b"", b"orphan"))
+    assert discovery._ipp_parse_response(body) == {}

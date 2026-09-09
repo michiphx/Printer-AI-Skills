@@ -128,6 +128,42 @@ class TestSplitModel:
         result = vendor_drivers.split_model(text)
         assert result == {"vendor": "", "device_id": text, "model": text}
 
+    @pytest.mark.parametrize(
+        "text, vendor, device_id",
+        [
+            # The brand is not always followed by a space; device_id feeds the
+            # vendor portal query, so it must not keep the brand.
+            ("Brother-MFC-L2750DW", "Brother", "MFC-L2750DW"),
+            ("Canon:LBP2900", "Canon", "LBP2900"),
+            ("Kyocera_ECOSYS_P2040", "Kyocera", "ECOSYS_P2040"),
+            # Longest keyword wins over the shorter one it contains.
+            ("Seiko Epson ET-4850", "Epson", "ET-4850"),
+            ("Hewlett Packard LaserJet 4", "HP", "LaserJet 4"),
+            ("Hewlett-Packard LaserJet 4", "HP", "LaserJet 4"),
+        ],
+    )
+    def test_brand_stripped_on_any_separator(self, text, vendor, device_id):
+        result = vendor_drivers.split_model(text)
+        assert result["vendor"] == vendor
+        assert result["device_id"] == device_id
+
+    def test_brand_only_string_keeps_text_as_device_id(self):
+        result = vendor_drivers.split_model("EPSON")
+        assert result["vendor"] == "Epson"
+        assert result["device_id"] == "EPSON"
+
+    @pytest.mark.parametrize("text", ["Alphaprint 3000", "Sharp MX-3070", "Graphtec CE6000"])
+    def test_brand_inside_a_word_is_not_a_vendor(self, text):
+        # "hp" lives inside "Alphaprint"/"Graphtec"; only whole words count.
+        result = vendor_drivers.split_model(text)
+        assert result["vendor"] == ""
+        assert result["device_id"] == text
+
+    def test_vendor_word_inside_string_is_removed_once(self):
+        result = vendor_drivers.split_model("LaserJet by Hewlett Packard")
+        assert result["vendor"] == "HP"
+        assert "hewlett" not in result["device_id"].lower()
+
 
 # --------------------------------------------------------------- epson_page_url
 
