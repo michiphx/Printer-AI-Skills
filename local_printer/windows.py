@@ -9,6 +9,7 @@ import win32con
 import win32print
 import pywintypes
 from utils.logger import logger
+from local_printer import win_render
 from models.model import (
     APIResponse,
     PrinterStatus,
@@ -708,49 +709,52 @@ def set_dev_mode(devmode, options: WindowsPrintOptions):
 
 
 # Formats a printer can be expected to interpret when handed the bytes verbatim.
+# Nothing is blocked on this any more: it is the list of extensions that may
+# fall back to the raw spooler path when the file is not a PDF.
 RAW_SAFE_EXTENSIONS = (".pdf", ".ps", ".prn", ".txt")
 
+# Extensions that still make sense to push through the spooler untouched once
+# we know the file is not a PDF (PostScript, driver-ready spool files, text).
+RAW_FALLBACK_EXTENSIONS = (".ps", ".prn", ".txt")
 
-def print_file(index: Optional[int] = None, file_path: str = "",
-               options: Optional[WindowsPrintOptions] = None):
-    # The Windows backend writes the file to the spooler as RAW data, which
-    # bypasses the driver entirely. Anything the device cannot interpret on its
-    # own would come out as pages of garbage, so refuse it up front.
-    extension = os.path.splitext(file_path)[1].lower()
-    if extension not in RAW_SAFE_EXTENSIONS:
-        return APIResponse.unsupported_media_type(
-            "Windows backend can only send PDF/PS/PRN/TXT as raw data; "
-            "convert the document to PDF first",
-            {"file_path": file_path, "extension": extension},
-        ).to_dict()
+RAW_NOTE = "sent as raw data; the printer must understand this format natively"
 
-    printer, error = resolve_printer(index)
-    if printer is None:
-        return error
-    printer_name = printer.name
+PYPDFIUM2_HINT = "pypdfium2 missing: uv tool install --reinstall printer-ai-skills"
+
+
+def _is_pdf(file_path: str) -> bool:
+    """True when the file starts with the %PDF header."""
+    with open(file_path, "rb") as f:
+        return f.read(5).startswith(b"%PDF")
+
+
+def _open_printer_devmode(printer_name: str, options: Optional[WindowsPrintOptions]):
+    """Open a printer and return (handle, devmode) with `options` applied.
+
+    The DEVMODE comes from the queue's own defaults, gets the caller's dmXXX
+    fields merged in and is then handed to DocumentProperties so the driver can
+    validate/normalise it.
+
+    Raises:
+        Exception: whatever OpenPrinter/GetPrinter raised.
+    """
+    handle = win32print.OpenPrinter(printer_name)
     try:
-        p = win32print.OpenPrinter(printer_name)
-    except Exception as e:
-        logger.error(f"[print_file] open printer {printer_name} failed: {e}")
-        return APIResponse.error(500, f"open printer error, err: {e}").to_dict()
-
-    devmode = None
-    try:
-        printer_info = win32print.GetPrinter(p, 2)
+        printer_info = win32print.GetPrinter(handle, 2)
         devmode = printer_info["pDevMode"]
         set_dev_mode(devmode, options)
-    except Exception as e:
-        logger.error(
-            f"[print_file] set_dev_mode failed on {printer_name}: {e} "
-            f"(devmode: {devmode})"
-        )
-        win32print.ClosePrinter(p)
-        return APIResponse.server_error(f"Error printing file: {str(e)}").to_dict()
+    except Exception:
+        win32print.ClosePrinter(handle)
+        raise
+    return handle, devmode
 
+
+def _validate_devmode(handle, printer_name: str, devmode) -> None:
+    """Let the driver validate the DEVMODE in place. Never fatal."""
     try:
         win32print.DocumentProperties(
             0,
-            p,
+            handle,
             printer_name,
             devmode,
             devmode,
@@ -760,32 +764,307 @@ def print_file(index: Optional[int] = None, file_path: str = "",
         # Not fatal: the job still goes out with the queue's own defaults
         logger.error(f"[print_file] DocumentProperties failed on {printer_name}: {e}")
 
+
+def _driver_max_copies(printer_name: str, port: str) -> int:
+    """How many copies the driver itself can produce (1 == none)."""
+    try:
+        value = win32print.DeviceCapabilities(
+            printer_name, port or "FILE:", win32con.DC_COPIES
+        )
+    except Exception as e:
+        logger.error(f"[print_file] DC_COPIES failed on {printer_name}: {e}")
+        return 1
+    if not isinstance(value, int) or value < 1:
+        return 1
+    return value
+
+
+def _print_raw(printer_name: str, file_path: str,
+               options: Optional[WindowsPrintOptions], note: str):
+    """Spool the file verbatim with the RAW datatype (no driver rendering)."""
+    try:
+        handle, devmode = _open_printer_devmode(printer_name, options)
+    except Exception as e:
+        logger.error(f"[print_file] open printer {printer_name} failed: {e}")
+        return APIResponse.error(500, f"open printer error, err: {e}").to_dict()
+
+    _validate_devmode(handle, printer_name, devmode)
+
     job_id = None
     try:
-        # Read file content as bytes
         with open(file_path, "rb") as f:
             file_content = f.read()
 
         doc_info = (file_path, None, "RAW")
-        job_id = win32print.StartDocPrinter(p, 1, doc_info)
-        win32print.StartPagePrinter(p)
-        win32print.WritePrinter(p, file_content)
-        win32print.EndPagePrinter(p)
-        win32print.EndDocPrinter(p)
+        job_id = win32print.StartDocPrinter(handle, 1, doc_info)
+        win32print.StartPagePrinter(handle)
+        win32print.WritePrinter(handle, file_content)
+        win32print.EndPagePrinter(handle)
+        win32print.EndDocPrinter(handle)
     except Exception as e:
         logger.error(f"Error printing file {file_path}: {e}")
         return APIResponse.server_error(f"Error printing file: {str(e)}").to_dict()
     finally:
-        win32print.ClosePrinter(p)
+        win32print.ClosePrinter(handle)
 
-    # If we get here, printing was successful
-    response = APIResponse.success(
+    return APIResponse.success(
         {
             "printer_name": printer_name,
             "file_path": file_path,
             "status": "submitted",
             "job_id": job_id,
-            "note": "sent as raw data; the printer must understand this format natively",
+            "method": "raw",
+            "note": note,
         }
-    )
-    return response.to_dict()
+    ).to_dict()
+
+
+def _open_pdf(file_path: str):
+    """Open a PDF with pypdfium2.
+
+    Returns:
+        (document, None) on success, (None, error_response_dict) otherwise.
+    """
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as e:
+        logger.error(f"[print_file] pypdfium2 unavailable: {e}")
+        return None, APIResponse.error(
+            501,
+            f"cannot render PDF without pypdfium2 ({PYPDFIUM2_HINT})",
+            {"file_path": file_path, "hint": PYPDFIUM2_HINT},
+        ).to_dict()
+
+    try:
+        return pdfium.PdfDocument(file_path), None
+    except Exception as e:
+        message = str(e)
+        logger.error(f"[print_file] cannot open PDF {file_path}: {message}")
+        if "password" in message.lower():
+            return None, APIResponse.error(
+                400,
+                "PDF is password-protected; remove the password before printing",
+                {"file_path": file_path, "detail": message},
+            ).to_dict()
+        return None, APIResponse.error(
+            400,
+            f"cannot read PDF: {message}",
+            {"file_path": file_path},
+        ).to_dict()
+
+
+def _apply_auto_orientation(devmode, options: Optional[WindowsPrintOptions], page) -> bool:
+    """Switch to landscape when the caller did not choose and the page is wide.
+
+    Returns:
+        bool: True when the orientation was flipped to landscape.
+    """
+    if options is not None and options.dmOrientation is not None:
+        return False
+    try:
+        width, height = page.get_size()
+    except Exception as e:
+        logger.error(f"[print_file] page size unavailable, keeping orientation: {e}")
+        return False
+    if width <= height:
+        return False
+    devmode.Orientation = win32con.DMORIENT_LANDSCAPE
+    devmode.Fields = devmode.Fields | win32con.DM_ORIENTATION
+    return True
+
+
+def _print_pdf_gdi(printer_name: str, port: str, file_path: str,
+                   options: Optional[WindowsPrintOptions]):
+    """Rasterise a PDF and draw every page onto the printer's device context.
+
+    This is the driver-based path: the driver sees ordinary GDI drawing calls,
+    so any Windows printer can print the document and the DEVMODE settings
+    (colour, duplex, paper, copies) are honoured by the driver itself.
+    """
+    try:
+        import win32gui
+        import win32ui
+        from PIL import ImageWin
+    except ImportError as e:
+        logger.error(f"[print_file] GDI dependency unavailable: {e}")
+        return APIResponse.error(
+            501,
+            f"GDI printing needs win32ui/win32gui (pywin32) and Pillow, err: {e}",
+            {"file_path": file_path},
+        ).to_dict()
+
+    pdf, error = _open_pdf(file_path)
+    if pdf is None:
+        return error
+
+    handle = None
+    dc = None
+    hdc = None
+    doc_started = False
+    try:
+        page_count = len(pdf)
+        if page_count < 1:
+            return APIResponse.error(
+                400, "PDF has no pages", {"file_path": file_path}
+            ).to_dict()
+
+        try:
+            handle, devmode = _open_printer_devmode(printer_name, options)
+        except Exception as e:
+            logger.error(f"[print_file] open printer {printer_name} failed: {e}")
+            return APIResponse.error(500, f"open printer error, err: {e}").to_dict()
+
+        landscape = _apply_auto_orientation(devmode, options, pdf[0])
+        _validate_devmode(handle, printer_name, devmode)
+
+        # Copies: the driver does them properly (and faster) whenever it can.
+        requested_copies = 1
+        if options is not None and options.dmCopies is not None:
+            requested_copies = max(1, int(options.dmCopies))
+        collate = bool(getattr(devmode, "Collate", 1))
+        if _driver_max_copies(printer_name, port) > 1:
+            copies_handled_by = "driver"
+            client_copies = 1
+        else:
+            copies_handled_by = "client" if requested_copies > 1 else "driver"
+            client_copies = requested_copies
+            devmode.Copies = 1
+
+        hdc = win32gui.CreateDC("WINSPOOL", printer_name, devmode)
+        dc = win32ui.CreateDCFromHandle(hdc)
+
+        logical_dpi_x = dc.GetDeviceCaps(win32con.LOGPIXELSX)
+        logical_dpi_y = dc.GetDeviceCaps(win32con.LOGPIXELSY)
+        printable_w = dc.GetDeviceCaps(win32con.HORZRES)
+        printable_h = dc.GetDeviceCaps(win32con.VERTRES)
+        physical_w = dc.GetDeviceCaps(win32con.PHYSICALWIDTH)
+        physical_h = dc.GetDeviceCaps(win32con.PHYSICALHEIGHT)
+        offset_x = dc.GetDeviceCaps(win32con.PHYSICALOFFSETX)
+        offset_y = dc.GetDeviceCaps(win32con.PHYSICALOFFSETY)
+
+        dpi = win_render.resolve_render_dpi(min(logical_dpi_x, logical_dpi_y))
+        scale = dpi / 72.0
+
+        title = os.path.basename(file_path) or "printer-ai"
+        job_id = dc.StartDoc(title)
+        doc_started = True
+
+        order = win_render.page_order(page_count, client_copies, collate)
+        for page_index in order:
+            page = pdf[page_index]
+            image = page.render(scale=scale).to_pil()
+            try:
+                # The printer DC's origin is already the top-left of the
+                # printable area, so the physical offsets are zero here; they
+                # stay parameters of fit_rect for callers working in physical
+                # page coordinates.
+                rect = win_render.fit_rect(
+                    image.width, image.height, printable_w, printable_h, 0, 0
+                )
+                dc.StartPage()
+                ImageWin.Dib(image).draw(dc.GetHandleOutput(), rect)
+                dc.EndPage()
+            finally:
+                # Free the bitmap before rendering the next page
+                image = None
+
+        dc.EndDoc()
+        doc_started = False
+    except Exception as e:
+        logger.error(f"[print_file] GDI print failed for {file_path}: {e}")
+        if dc is not None and doc_started:
+            try:
+                dc.AbortDoc()
+            except Exception as abort_error:
+                logger.error(f"[print_file] AbortDoc failed: {abort_error}")
+        return APIResponse.server_error(f"Error printing file: {str(e)}").to_dict()
+    finally:
+        if dc is not None:
+            try:
+                dc.DeleteDC()
+            except Exception as e:
+                logger.error(f"[print_file] DeleteDC failed: {e}")
+        if handle is not None:
+            try:
+                win32print.ClosePrinter(handle)
+            except Exception as e:
+                logger.error(f"[print_file] ClosePrinter failed: {e}")
+        try:
+            pdf.close()
+        except Exception:
+            pass
+
+    return APIResponse.success(
+        {
+            "printer_name": printer_name,
+            "file_path": file_path,
+            "status": "submitted",
+            "job_id": job_id,
+            "method": "gdi",
+            "pages": page_count,
+            "sheets_drawn": len(order),
+            "dpi": dpi,
+            "copies": requested_copies,
+            "copies_handled_by": copies_handled_by,
+            "collate": collate,
+            "auto_landscape": landscape,
+            "printable_area": [printable_w, printable_h],
+            "physical_page": [physical_w, physical_h],
+            "physical_offset": [offset_x, offset_y],
+        }
+    ).to_dict()
+
+
+def print_file(index: Optional[int] = None, file_path: str = "",
+               options: Optional[WindowsPrintOptions] = None,
+               raw: bool = False):
+    """Print a file on Windows.
+
+    By default a PDF is rasterised and drawn onto the printer's device context
+    through the driver, so every Windows printer can print it and the DEVMODE
+    options are honoured. `raw=True` bypasses the driver and spools the bytes
+    verbatim - only useful for devices that understand the format themselves.
+
+    Args:
+        index: Printer index (1-based), or None for the default printer.
+        file_path: Path of the file to print.
+        options: WindowsPrintOptions (dmXXX fields), or None.
+        raw: Send the file to the spooler as RAW data instead of rendering it.
+
+    Returns:
+        dict: APIResponse payload.
+    """
+    printer, error = resolve_printer(index)
+    if printer is None:
+        return error
+    printer_name = printer.name
+
+    if raw:
+        # The caller explicitly asked for the bytes to go out untouched.
+        return _print_raw(printer_name, file_path, options, RAW_NOTE)
+
+    try:
+        is_pdf = _is_pdf(file_path)
+    except OSError as e:
+        logger.error(f"[print_file] cannot read {file_path}: {e}")
+        return APIResponse.not_found(
+            f"cannot read file: {e}", {"file_path": file_path}
+        ).to_dict()
+
+    if is_pdf:
+        return _print_pdf_gdi(printer_name, printer.port, file_path, options)
+
+    extension = os.path.splitext(file_path)[1].lower()
+    if extension in RAW_FALLBACK_EXTENSIONS:
+        return _print_raw(
+            printer_name,
+            file_path,
+            options,
+            f"{extension} is not a PDF; {RAW_NOTE}",
+        )
+
+    return APIResponse.unsupported_media_type(
+        "not a PDF: convert the document to PDF first, or re-run with raw "
+        "printing if the device understands this format natively",
+        {"file_path": file_path, "extension": extension},
+    ).to_dict()

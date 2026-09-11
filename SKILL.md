@@ -1,6 +1,6 @@
 ---
 name: printer-ai
-description: "Cross-platform local printer CLI - discover, diagnose, set up and print to local printers (Windows/macOS/Linux) via the printer-ai CLI. Use when the user needs to print files, find or install a network printer, look up or download a manufacturer driver, check whether a printer is really online, or manage print jobs. NOT for: cloud/remote printers."
+description: "Cross-platform local printer CLI - print any common file type (PDF, Word/Excel/PowerPoint and other Office documents, images, plain text and code, Markdown, HTML/SVG, CSV) to local printers on Windows/macOS/Linux via the printer-ai CLI, which converts the file to PDF automatically. Also discovers, diagnoses and sets up printers. Use when the user needs to print a file, find or install a network printer, look up or download a manufacturer driver, check whether a printer is really online, or manage print jobs. NOT for: cloud/remote printers."
 metadata: {"openclaw":{"emoji":"🖨️","requires":{"bins":["printer-ai"]},"install":[{"id":"uv","kind":"uv","package":"git+https://github.com/michiphx/Printer-AI-Skills.git","bins":["printer-ai"],"label":"Install printer-ai (uv)"}]}}
 ---
 
@@ -22,7 +22,9 @@ the JSON just to detect failure.
 
 ✅ **USE this skill when:**
 
-- User wants to print local files (PDF, images, Office documents, etc.)
+- User wants to print a local file of any common type — PDF, Word/Excel/
+  PowerPoint or OpenDocument, images, plain text or code, Markdown, HTML/SVG,
+  CSV. The CLI converts it to PDF itself; do not ask the user to convert first
 - Query local printer list and status
 - Manage print jobs: check status, cancel jobs
 - Get detailed printer attributes / capabilities
@@ -91,23 +93,105 @@ Returns all options the *driver* exposes (paper size, color mode, duplex, …).
 
 ### 4. Print a File
 
-On **Windows** the file is sent to the spooler as raw data, so only
-**PDF, PS, PRN and TXT** are accepted. Anything else is refused with code `415`
-— convert it to PDF first (e.g. print it to *Microsoft Print to PDF*, or use the
-source application's own "Export/Save as PDF") and print the PDF. Note that the
-target printer must itself understand PDF/PostScript for a PDF to come out
-right; `--options` are best-effort on this path.
+**Conversion is automatic on every platform.** `print` normalises the file to
+PDF before the printer backend sees it: Office documents, images, text and code,
+Markdown, HTML/SVG and CSV all just work. **Never tell the user to convert the
+file to PDF first** and never do it yourself with another tool — pass the
+original path.
 
 ```bash
-printer-ai print /path/to/file.pdf                # no --index → the default printer
-printer-ai print /path/to/file.pdf --index 2      # a specific printer
+printer-ai print /path/to/report.docx             # no --index → the default printer
+printer-ai print /path/to/photo.jpg --index 2     # a specific printer
 
 # macOS/Linux (CUPS/IPP option names)
-printer-ai print /path/to/file.pdf --options '{"copies":"2","media":"A4","orientation_requested":"3","print_color_mode":"color"}'
+printer-ai print report.docx --options '{"copies":"2","media":"A4","orientation_requested":"3","print_color_mode":"color"}'
 
 # Windows (DEVMODE option names)
-printer-ai print /path/to/file.pdf --options '{"dmCopies":2,"dmPaperSize":9,"dmOrientation":1,"dmColor":2}'
+printer-ai print report.docx --options '{"dmCopies":2,"dmPaperSize":9,"dmOrientation":1,"dmColor":2}'
 ```
+
+A successful result carries `job_id`, `printer_name`, `file_path`, plus
+`converter`, `converted`, `converted_from` and `conversion_notes` when a
+conversion happened. On Windows it also carries `method` (`"gdi"` or `"raw"`),
+`pages`, `dpi`, `copies` and `copies_handled_by`.
+
+**When a `415` comes back**, the conversion tool for that format is missing —
+this is not the user's fault and not a reason to give up. The result already
+carries `data.hint`; run `printer-ai formats` for the whole picture and relay
+the `install_hint` of the converter in question verbatim (usually "install
+LibreOffice" for Office/CSV, or "install a Chromium-family browser" for
+HTML/SVG/Markdown). Then offer to retry once they have installed it.
+
+```bash
+printer-ai formats          # human-readable
+printer-ai formats --json   # converter, extensions, available, via, install_hint, page_size
+```
+
+`formats` always exits `0`, so it is safe to run after a failure.
+
+**Other flags:**
+
+- `printer-ai convert FILE [--out PATH_OR_DIR]` — convert only, no printing.
+  Use it to preview or debug what will actually be printed (open the PDF, check
+  the page count) before committing paper, or when the user just wants a PDF.
+  Without `--out` the PDF lands next to the source file; an `--out` ending in
+  `.pdf` names the file, anything else is treated as a directory.
+- `--keep-pdf` — print *and* keep the converted PDF; its location comes back in
+  `data.pdf_path`. Use it when the user wants the PDF too.
+- `--raw` — skip conversion entirely and push the bytes at the device (CUPS
+  `-o raw`, Windows RAW spool). **Only** for printer-native streams: a `.prn`
+  spool file, PostScript or PCL aimed at a device that speaks it. Never reach
+  for `--raw` to work around a `415`; it will print garbage.
+
+#### Supported file types (quick table)
+
+| Type | Extensions | Needs |
+|---|---|---|
+| PDF / PostScript / spool | `.pdf` `.ps` `.prn` | nothing (passed through) |
+| Images (multi-frame → multi-page) | `.jpg` `.jpeg` `.png` `.gif` `.bmp` `.tif` `.tiff` `.webp` `.ico` `.tga` `.ppm` … | nothing (bundled Pillow) |
+| Text, code, logs, config, data | `.txt` `.log` `.json` `.yaml` `.toml` `.xml` `.sql` `.py` `.js` `.ts` `.sh` `.ps1` `.c` `.go` `.rs` … (~75) | nothing (bundled reportlab) |
+| Markdown | `.md` `.markdown` `.mdown` `.mkd` `.mdtext` | browser or LibreOffice; with neither, the source prints as plain text |
+| HTML / SVG | `.html` `.htm` `.xhtml` `.svg` | a Chromium-family browser, LibreOffice as fallback |
+| Office documents | `.doc` `.docx` `.odt` `.rtf` `.xls` `.xlsx` `.ods` `.ppt` `.pptx` `.odp` `.vsdx` … | LibreOffice, or Microsoft Office on Windows |
+| CSV / TSV | `.csv` `.tsv` | LibreOffice for a table; falls back to plain text |
+
+Format is decided by extension, with magic bytes deciding when the extension is
+missing or unknown (and overriding a text-ish extension that actually holds a
+PDF, image or Office file). An unknown binary is refused with `415`.
+
+#### Mapping plain-language requests to options
+
+Translate what the user said into one `--options` JSON object. Left column is
+what they say; pick the column for the platform you are on.
+
+| User says | macOS/Linux (CUPS/IPP) | Windows (DEVMODE) |
+|---|---|---|
+| "black and white" / "grayscale" | `{"print_color_mode":"monochrome"}` | `{"dmColor":1}` |
+| "in colour" | `{"print_color_mode":"color"}` | `{"dmColor":2}` |
+| "double-sided" / "duplex" | `{"sides":"two-sided-long-edge"}` | `{"dmDuplex":2}` |
+| "double-sided, flip on the short edge" | `{"sides":"two-sided-short-edge"}` | `{"dmDuplex":3}` |
+| "single-sided" | `{"sides":"one-sided"}` | `{"dmDuplex":1}` |
+| "3 copies" | `{"copies":"3"}` | `{"dmCopies":3}` |
+| "landscape" | `{"orientation_requested":"4"}` | `{"dmOrientation":2}` |
+| "portrait" | `{"orientation_requested":"3"}` | `{"dmOrientation":1}` |
+| "pages 2 to 5" | `{"page_ranges":"2-5"}` | not a DEVMODE field — convert the range yourself first (e.g. `printer-ai convert`, then print a trimmed PDF), or print the whole document |
+| "on Letter" / "on A4" | `{"media":"Letter"}` / `{"media":"A4"}` | `{"dmPaperSize":1}` / `{"dmPaperSize":9}` |
+| "draft quality" | `{"print_quality":"3"}` | `{"dmPrintQuality":-1}` |
+| "2 pages per sheet" | `{"number_up":"2"}` | not a DEVMODE field — no CLI equivalent |
+
+Combine freely: "in colour, double-sided, 2 copies" →
+`'{"print_color_mode":"color","sides":"two-sided-long-edge","copies":"2"}'` on
+macOS/Linux, `'{"dmColor":2,"dmDuplex":2,"dmCopies":2}'` on Windows.
+
+Two things to keep in mind:
+
+- Options are handed to the driver, not enforced. A queue that exposes no duplex
+  will not duplex. Check `printer-ai attrs INDEX` when the user cares, or when a
+  previous job came out wrong.
+- On Windows the **page size a document is laid out on** (for images, text and
+  Markdown) is a conversion-time decision — set `PRINTER_AI_PAGE_SIZE`, not
+  `dmPaperSize` — while `dmPaperSize` tells the printer which paper to pull.
+  For A4 output on a Letter-locale machine, set both.
 
 ### 5. Track Jobs
 
@@ -141,7 +225,22 @@ printer-ai cancel-job JOB_ID
 | `dmOrientation` | `1`=portrait, `2`=landscape | Orientation |
 | `dmColor` | `1`=mono, `2`=color | Color mode |
 | `dmDuplex` | `1`=simplex, `2`=long-edge, `3`=short-edge | Duplex |
-| `dmPrintQuality` | `-4`=default | Quality |
+| `dmPrintQuality` | `-1`=draft, `-2`=low, `-3`=medium, `-4`=high, or a positive DPI | Quality. Passed to the driver; it does **not** change the DPI the PDF is rasterised at (that is `PRINTER_AI_RENDER_DPI`) |
+| `dmCollate` | `1`=collate, `0`=no collate | Collation |
+| `dmDefaultSource` | driver-specific | Paper tray |
+
+**Windows printing is no longer raw.** The converted PDF is rasterised with
+pypdfium2 and drawn onto the printer's device context through GDI, so **any**
+installed Windows printer can print it and the DEVMODE options above are
+honoured by the driver — colour, duplex, paper size, tray, quality, copies,
+collate. Pages are scaled to fit the printable area, centred, aspect preserved;
+a landscape page auto-rotates unless you set `dmOrientation` yourself. The
+trade-off is that the output is a raster image (text slightly softer than a
+native PDF, larger spool files), and a driver that ignores a DEVMODE field still
+ignores it. `.ps`, `.prn` and `.txt` fall back to the raw spooler path
+automatically; `--raw` forces it for any file. If `pypdfium2` is missing the
+result is `501` with a reinstall hint (`uv tool install --reinstall
+printer-ai-skills`).
 
 ## Command Reference
 
@@ -150,7 +249,9 @@ printer-ai cancel-job JOB_ID
 | `printers` | List installed queues | `--json` |
 | `status [INDEX]` | Spooler status of one queue (default printer without `INDEX`) | `--json` |
 | `attrs [INDEX]` | Driver capabilities + DevMode | — |
-| `print FILE` | Submit a print job (default printer without `--index`) | `--index`, `--options` |
+| `print FILE` | Submit a print job; the file is converted to PDF first (default printer without `--index`) | `--index`, `--options`, `--raw`, `--keep-pdf` |
+| `convert FILE` | Convert to PDF only, do not print | `--out PATH_OR_DIR`, `--json` |
+| `formats` | Which file types can be printed here, what is missing and how to install it; always exits `0` | `--json` |
 | `jobs` | List print jobs | `--printer`, `--json` |
 | `job-status JOB_ID` | One job + its printer status | — |
 | `cancel-job JOB_ID` | Cancel a job | — |
@@ -396,6 +497,12 @@ powershell -ExecutionPolicy Bypass -File "<skill base directory>\scripts\win-pur
 
 Things that cost time once; check them before debugging further.
 
+**A `415` is a missing converter, not an unprintable file.** Office documents
+need LibreOffice (or Microsoft Office on Windows), HTML/SVG/Markdown need a
+Chromium-family browser (LibreOffice is a basic-HTML fallback). Run
+`printer-ai formats`, relay the `install_hint`, and retry — do not fall back to
+`--raw`, and do not ask the user to export a PDF by hand.
+
 **A queue reporting `idle` proves nothing.** The Windows spooler caches state.
 A printer that is powered off, or whose WSD entry still points at an address
 from a previous network, reports `idle` forever. Use `diagnose`, or a test page
@@ -450,6 +557,17 @@ scrape will work.
 - `status` reflects the spooler cache — use `diagnose` to confirm real reachability
 - Print option formats differ by platform: macOS/Linux uses CUPS/IPP strings,
   Windows uses DEVMODE integers
+- Every file is converted to PDF before printing. A `415` means the converter's
+  tool is missing, not that the format is unsupported — run `printer-ai formats`
+  and relay the `install_hint`
+- Environment variables that change conversion and printing (all optional):
+
+  | Variable | Effect |
+  |---|---|
+  | `PRINTER_AI_PAGE_SIZE` | `A4` or `Letter` (also `Legal`, `A3`, `A5`) — the page images, text/code and Markdown are laid out on. Default: A4, or Letter for `en_US`-style locales |
+  | `PRINTER_AI_BROWSER` | Path to, or name of, the Chromium-family browser used for HTML/SVG/Markdown. Several candidates may be given, separated by the platform's path separator |
+  | `PRINTER_AI_SOFFICE` | Full path to the LibreOffice `soffice` executable when it is not on `PATH` or in a standard location |
+  | `PRINTER_AI_RENDER_DPI` | Windows GDI printing: rasterisation DPI, `36`–`1200`. Default: the printer's own DPI capped at 300 |
 - `attrs` reports what the *driver* exposes; `probe`/`discover` report what the
   *device* advertises. When they disagree, the device is right and the driver is
   the limitation.

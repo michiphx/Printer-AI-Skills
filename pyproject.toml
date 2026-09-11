@@ -1,13 +1,19 @@
 [project]
 name = "printer-ai-skills"
-version = "1.1.0"
-description = "Cross-platform local printer CLI for AI agents: discover, diagnose, set up and print"
+version = "1.2.0"
+description = "Cross-platform local printer CLI for AI agents: discover, diagnose, set up and print any file"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     'pycups>=2.0.4; sys_platform == "darwin" or sys_platform == "linux"',
     "pywin32>=311; sys_platform == 'win32'",
+    # Universal "convert to PDF" layer (all platforms)
+    "Pillow>=10.0",        # images -> PDF; also the DIB bridge for GDI printing on Windows
+    "reportlab>=4.0",      # plain text / code -> PDF (pure Python)
+    "markdown>=3.5",       # Markdown -> HTML (then HTML -> PDF via a browser or LibreOffice)
+    # Driver-based printing on Windows: rasterise PDF pages and hand them to the printer driver
+    "pypdfium2>=4.0; sys_platform == 'win32'",
 ]
 
 [project.urls]

@@ -323,7 +323,7 @@ def get_printer_attrs(index: Optional[int] = None) -> Dict[str, Any]:
 
 def print_file(
     index: Optional[int] = None, file_path: str = "",
-    options: Optional[LinuxPrintOptions] = None
+    options: Optional[LinuxPrintOptions] = None, raw: bool = False
 ) -> dict:
     """
     Print file using CUPS
@@ -332,6 +332,8 @@ def print_file(
         index: Printer index
         file_path: Path to the file to print
         options: LinuxPrintOptions instance (optional)
+        raw: Send the file unfiltered (the `lp -o raw` equivalent). Use it only
+            for data the device itself understands - CUPS will not convert it.
 
     Returns:
         dict: Response with job_id if successful
@@ -379,6 +381,11 @@ def print_file(
         # Convert options to dict for CUPS API
         print_options = options.to_dict() if options else {}
 
+        # `raw` tells CUPS to skip its filter chain and hand the bytes to the
+        # device untouched - the IPP equivalent of `lp -o raw`.
+        if raw:
+            print_options["raw"] = "true"
+
         # Set default title if not provided
         title = os.path.basename(file_path)
 
@@ -399,6 +406,7 @@ def print_file(
                 "file_path": file_path,
                 "title": title,
                 "status": "submitted",
+                "raw": bool(raw),
             }
         )
         return response.to_dict()

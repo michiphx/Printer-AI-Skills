@@ -10,10 +10,17 @@ Usage:
     printer-ai printers              # list printers
     printer-ai status [INDEX]        # printer status (default printer if omitted)
     printer-ai attrs [INDEX]         # printer attributes
-    printer-ai print FILE            # print a file
+    printer-ai print FILE            # print any file (converted to PDF first)
+    printer-ai print FILE --raw      # send the file unchanged, no conversion
+    printer-ai print FILE --keep-pdf # keep (and report) the converted PDF
+    printer-ai convert FILE [--out P]# convert to PDF only, do not print
+    printer-ai formats               # which formats can be printed here
     printer-ai jobs                  # list print jobs
     printer-ai job-status JOB_ID     # query one job
     printer-ai cancel-job JOB_ID     # cancel a job
+
+Any file `print` is given is normalised to PDF by local_printer.convert before
+it reaches the platform backend, so backends only ever handle PDFs.
 """
 
 import argparse
@@ -189,8 +196,15 @@ def cmd_attrs(args):
     finish(backend.get_printer_attrs(args.index), True)
 
 
+def _conversion_failure(exc, file_path):
+    """Turn a ConversionError into the CLI's 415 result."""
+    data = exc.to_data()
+    data.setdefault("file_path", file_path)
+    return {"code": 415, "msg": str(exc), "data": data}
+
+
 def cmd_print(args):
-    """Print a file."""
+    """Print a file, converting it to PDF first unless --raw was given."""
     backend, error = _backend()
     if error:
         finish(error, False)
@@ -216,7 +230,39 @@ def cmd_print(args):
         except TypeError as e:
             finish({"code": 400, "msg": f"invalid print options: {e}", "data": {}}, False)
 
-    result = backend.print_file(args.index, args.file_path, print_options)
+    # Normalise the file to PDF so the backend only ever sees something it can
+    # actually render. --raw skips this and hands the bytes over untouched.
+    from local_printer import convert as convert_module
+
+    send_path = args.file_path
+    conversion = None
+    if not args.raw:
+        # --keep-pdf leaves the PDF in its temporary directory instead of
+        # deleting it, so nothing is ever written next to the user's file.
+        try:
+            conversion = convert_module.to_pdf(args.file_path)
+        except convert_module.ConversionError as exc:
+            finish(_conversion_failure(exc, args.file_path), True)
+        send_path = conversion.pdf_path
+
+    try:
+        result = backend.print_file(args.index, send_path, print_options, raw=args.raw)
+    finally:
+        # Both backends read the file synchronously before returning, so the
+        # temporary PDF can go as soon as print_file is done with it.
+        if conversion is not None and not args.keep_pdf:
+            convert_module.cleanup(conversion)
+
+    if result.get("code") == 200 and conversion is not None:
+        data = result.setdefault("data", {})
+        data["converter"] = conversion.converter
+        data["converted"] = conversion.converted
+        if conversion.converted:
+            data["converted_from"] = conversion.source_path
+        if conversion.notes:
+            data["conversion_notes"] = list(conversion.notes)
+        if args.keep_pdf:
+            data["pdf_path"] = conversion.pdf_path
 
     if result.get("code") != 200:
         # Dump the whole result: it carries the reason and any hint
@@ -227,9 +273,122 @@ def cmd_print(args):
     print(f"Print job submitted  job_id: {job_id}")
     print(f"  printer: {data.get('printer_name', '')}")
     print(f"  file:    {data.get('file_path', '')}")
+    if data.get("converted_from"):
+        print(f"  converted from: {data['converted_from']} (via {data.get('converter')})")
+    if data.get("pdf_path"):
+        print(f"  pdf kept at: {data['pdf_path']}")
+    if args.raw:
+        print("  mode:    raw (sent unconverted)")
     if data.get("note"):
         print(f"  note:    {data['note']}")
     print(f"  check with: printer-ai job-status {job_id}")
+    finish(result, False)
+
+
+def _resolve_out_target(out):
+    """Split a --out value into (out_dir, final_path_or_None).
+
+    An existing directory (or a value with no .pdf suffix) is a directory; a
+    value ending in .pdf names the PDF itself.
+    """
+    if not out:
+        return None, None
+    out = os.path.abspath(os.path.expanduser(out))
+    if os.path.isdir(out):
+        return out, None
+    if out.lower().endswith(".pdf"):
+        return os.path.dirname(out) or os.getcwd(), out
+    return out, None
+
+
+def cmd_convert(args):
+    """Convert a file to PDF without printing it."""
+    from local_printer import convert as convert_module
+
+    if not os.path.exists(args.file_path):
+        finish(
+            {
+                "code": 404,
+                "msg": f"file not found: {args.file_path}",
+                "data": {"file_path": args.file_path},
+            },
+            args.json,
+        )
+
+    out_dir, final_path = _resolve_out_target(args.out)
+    if out_dir is None:
+        # No --out: write next to the source file, which is what a human means
+        # by "convert this".
+        out_dir = os.path.dirname(os.path.abspath(args.file_path)) or os.getcwd()
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        finish({"code": 400, "msg": f"cannot use --out directory: {e}", "data": {}},
+               args.json)
+
+    try:
+        conversion = convert_module.to_pdf(args.file_path, out_dir=out_dir)
+    except convert_module.ConversionError as exc:
+        finish(_conversion_failure(exc, args.file_path), True)
+
+    pdf_path = conversion.pdf_path
+    notes = list(conversion.notes)
+    if final_path and os.path.abspath(final_path) != os.path.abspath(pdf_path):
+        if conversion.native:
+            # Never move the user's own file around; copy it to the target.
+            import shutil
+
+            shutil.copyfile(pdf_path, final_path)
+            notes.append("copied: the source was already printable")
+        else:
+            os.replace(pdf_path, final_path)
+        pdf_path = final_path
+
+    result = {
+        "code": 200,
+        "msg": "success",
+        "data": {
+            "pdf_path": pdf_path,
+            "source": conversion.source_path,
+            "converter": conversion.converter,
+            "converted": conversion.converted,
+            "notes": notes,
+        },
+    }
+    if args.json:
+        finish(result, True)
+    print(pdf_path)
+    finish(result, False)
+
+
+def cmd_formats(args):
+    """List the file formats this machine can print."""
+    from local_printer import convert as convert_module
+
+    catalog = convert_module.format_catalog()
+    result = {
+        "code": 200,
+        "msg": "success",
+        "data": {
+            "page_size": convert_module.page_size_name(),
+            "converters": catalog,
+        },
+    }
+    if args.json:
+        finish(result, True)
+
+    print(f"Printable formats (pages laid out as {result['data']['page_size']}):\n")
+    for entry in catalog:
+        mark = "[ok]" if entry["available"] else "[missing]"
+        print(f"  {mark} {entry['converter']}")
+        print(f"      via: {entry['via'] or entry['detail']}")
+        extensions = entry["extensions"]
+        shown = ", ".join(extensions[:18])
+        if len(extensions) > 18:
+            shown += f", ... (+{len(extensions) - 18} more)"
+        print(f"      handles: {shown}")
+        if not entry["available"]:
+            print(f"      install: {entry['install_hint']}")
     finish(result, False)
 
 
@@ -554,7 +713,28 @@ def build_parser():
     p_print.add_argument("--index", type=int, default=None,
                          help="printer index (1-based; default: the default printer)")
     p_print.add_argument("--options", help="print options as a JSON string")
+    p_print.add_argument("--raw", action="store_true",
+                         help="skip the PDF conversion and send the file unchanged "
+                              "(only for data the printer understands itself)")
+    p_print.add_argument("--keep-pdf", action="store_true",
+                         help="keep the converted PDF and report its path")
     p_print.set_defaults(func=cmd_print)
+
+    # convert
+    p_conv = subparsers.add_parser(
+        "convert", help="convert a file to PDF without printing it")
+    p_conv.add_argument("file_path", help="path of the file to convert")
+    p_conv.add_argument("--out", default=None, metavar="PATH_OR_DIR",
+                        help="output PDF path or directory "
+                             "(default: next to the source file)")
+    p_conv.add_argument("--json", action="store_true", help="output JSON")
+    p_conv.set_defaults(func=cmd_convert)
+
+    # formats
+    p_fmt = subparsers.add_parser(
+        "formats", help="list the file formats this machine can print")
+    p_fmt.add_argument("--json", action="store_true", help="output JSON")
+    p_fmt.set_defaults(func=cmd_formats)
 
     # jobs
     p_jobs = subparsers.add_parser("jobs", help="list print jobs")

@@ -20,7 +20,82 @@ def test_help_exits_zero_and_lists_commands(cli):
     assert "printers" in out
     assert "setup" in out
     assert "driver-search" in out
+    assert "convert" in out
+    assert "formats" in out
     assert out.isascii()
+
+
+def test_print_help_documents_the_conversion_flags(cli):
+    code, out, err = cli("print", "--help")
+    assert code == 0
+    assert "--raw" in out
+    assert "--keep-pdf" in out
+
+
+# ==================== convert / formats ====================
+#
+# Neither command needs a printer backend, so these run everywhere.
+
+
+def test_formats_lists_converters(cli):
+    code, out, err = cli("formats")
+    assert code == 0
+    assert "passthrough" in out
+    assert "office" in out
+    assert out.isascii()
+
+
+def test_formats_json(cli):
+    code, out, err = cli("formats", "--json")
+    assert code == 0
+    result = parse_json_stdout(out)
+    assert result["code"] == 200
+    converters = result["data"]["converters"]
+    assert {"passthrough", "text", "image"} <= {c["converter"] for c in converters}
+    passthrough = next(c for c in converters if c["converter"] == "passthrough")
+    assert passthrough["available"] is True
+
+
+def test_convert_text_file_prints_the_pdf_path(cli, tmp_path):
+    source = tmp_path / "notes.txt"
+    source.write_text("hello from the CLI\n")
+
+    code, out, err = cli("convert", str(source))
+    assert code == 0
+
+    pdf_path = out.strip()
+    assert pdf_path.endswith(".pdf")
+    with open(pdf_path, "rb") as handle:
+        assert handle.read(5) == b"%PDF-"
+
+
+def test_convert_json_shape(cli, tmp_path):
+    source = tmp_path / "notes.txt"
+    source.write_text("hello\n")
+
+    code, out, err = cli("convert", str(source), "--json")
+    assert code == 0
+    data = parse_json_stdout(out)["data"]
+    assert data["converter"] == "text"
+    assert data["source"] == str(source)
+    assert isinstance(data["notes"], list)
+
+
+def test_convert_missing_file_is_404(cli, tmp_path):
+    code, out, err = cli("convert", str(tmp_path / "nope.txt"), "--json")
+    assert code == 1
+    assert parse_json_stdout(out)["code"] == 404
+
+
+def test_convert_unsupported_file_is_415_with_hint(cli, tmp_path):
+    blob = tmp_path / "blob.bin"
+    blob.write_bytes(b"\x00\x01\xff\xfe" * 64)
+
+    code, out, err = cli("convert", str(blob))
+    assert code == 1
+    result = parse_json_stdout(out)
+    assert result["code"] == 415
+    assert result["data"]["hint"]
 
 
 @has_windows_backend
