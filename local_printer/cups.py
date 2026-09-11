@@ -421,6 +421,81 @@ def print_file(
         return response.to_dict()
 
 
+# Job state values (IPP job-state enum):
+# 3 = pending, 4 = pending-held, 5 = processing,
+# 6 = processing-stopped, 7 = canceled, 8 = aborted, 9 = completed
+JOB_STATE_MAP = {
+    3: "pending",
+    4: "pending-held",
+    5: "processing",
+    6: "processing-stopped",
+    7: "canceled",
+    8: "aborted",
+    9: "completed",
+}
+
+# CUPS' getJobs() only returns a tiny default attribute set (in practice just
+# job-uri), so everything we want has to be requested explicitly. Note that
+# CUPS does NOT return `job-printer-name` for jobs at all - the queue name has
+# to be parsed out of job-printer-uri (see job_printer_name()).
+JOB_REQUESTED_ATTRIBUTES = [
+    "job-id",
+    "job-name",
+    "job-printer-uri",
+    "job-state",
+    "job-state-reasons",
+    "job-priority",
+    "job-k-octets",
+    "job-impressions",
+    "job-impressions-completed",
+    "job-originating-user-name",
+    "time-at-creation",
+    "time-at-processing",
+    "time-at-completed",
+    "document-name-supplied",
+]
+
+
+def job_printer_name(job_info: Dict[str, Any]) -> str:
+    """Derive the queue name from a job record.
+
+    CUPS reports the owning queue as a URI like
+    `ipp://localhost/printers/ET-4850`; there is no `job-printer-name`
+    attribute. Returns "" when the URI is missing or unparsable.
+    """
+    printer_uri = job_info.get("job-printer-uri") or job_info.get("printer-uri") or ""
+    if isinstance(printer_uri, (list, tuple)):
+        printer_uri = printer_uri[0] if printer_uri else ""
+    if printer_uri and "/printers/" in printer_uri:
+        return printer_uri.split("/printers/")[-1].split("/")[0]
+    return ""
+
+
+def job_display_name(job_info: Dict[str, Any]) -> str:
+    """Human-readable job name: the supplied document name, else job-name."""
+    return job_info.get("document-name-supplied") or job_info.get("job-name") or ""
+
+
+def _get_jobs_with_attributes(conn, which_jobs: str = "all", my_jobs: bool = False):
+    """Call getJobs() asking for the attributes we actually need.
+
+    `requested_attributes` needs pycups >= 1.9.72; older builds raise TypeError,
+    in which case we fall back to the bare call rather than failing outright.
+    """
+    try:
+        return conn.getJobs(
+            which_jobs=which_jobs,
+            my_jobs=my_jobs,
+            requested_attributes=list(JOB_REQUESTED_ATTRIBUTES),
+        )
+    except TypeError:
+        logger.warning(
+            "pycups getJobs() does not support requested_attributes; "
+            "job details will be incomplete"
+        )
+        return conn.getJobs(which_jobs=which_jobs, my_jobs=my_jobs)
+
+
 def get_print_jobs(printer_name: str = None) -> Dict[str, Any]:
     """Get print jobs for a specific printer or all printers
 
@@ -434,40 +509,34 @@ def get_print_jobs(printer_name: str = None) -> Dict[str, Any]:
         conn = cups.Connection()
 
         # Get all jobs
-        jobs = conn.getJobs(which_jobs="all", my_jobs=False)
+        jobs = _get_jobs_with_attributes(conn, which_jobs="all", my_jobs=False)
 
         all_jobs = []
         for job_id, job_info in jobs.items():
+            job_info = job_info or {}
+            derived_printer = job_printer_name(job_info)
+
             # Filter by printer name if specified
-            if printer_name and job_info.get("job-printer-name") != printer_name:
+            if printer_name and derived_printer != printer_name:
                 continue
 
-            # Job state values:
-            # 3 = pending, 4 = pending-held, 5 = processing,
-            # 6 = processing-stopped, 7 = canceled, 8 = aborted, 9 = completed
             job_state = job_info.get("job-state", 0)
-            state_map = {
-                3: "pending",
-                4: "pending-held",
-                5: "processing",
-                6: "processing-stopped",
-                7: "canceled",
-                8: "aborted",
-                9: "completed",
-            }
+
+            k_octets = job_info.get("job-k-octets", 0) or 0
+            impressions_done = job_info.get("job-impressions-completed", 0) or 0
 
             print_job = PrintJob(
-                job_id=job_id,
-                printer_name=job_info.get("job-printer-name", ""),
-                job_name=job_info.get("job-name", ""),
-                status=state_map.get(job_state, "unknown"),
-                priority=job_info.get("job-priority", 0),
-                size=job_info.get("job-k-octets", 0) * 1024,  # Convert KB to bytes
-                pages=job_info.get("job-impressions-completed", 0),
-                user=job_info.get("job-originating-user-name", ""),
-                submitted_time=job_info.get("time-at-creation", 0),
-                total_pages=job_info.get("job-impressions", 0),
-                pages_printed=job_info.get("job-impressions-completed", 0),
+                job_id=job_info.get("job-id", job_id),
+                printer_name=derived_printer,
+                job_name=job_display_name(job_info),
+                status=JOB_STATE_MAP.get(job_state, "unknown"),
+                priority=job_info.get("job-priority", 0) or 0,
+                size=k_octets * 1024,  # Convert KB to bytes
+                pages=impressions_done,
+                user=job_info.get("job-originating-user-name", "") or "",
+                submitted_time=job_info.get("time-at-creation", 0) or 0,
+                total_pages=job_info.get("job-impressions", 0) or 0,
+                pages_printed=impressions_done,
             )
             all_jobs.append(print_job.to_dict())
 
@@ -499,33 +568,18 @@ def get_print_job_status(job_id: int) -> Dict[str, Any]:
             response = APIResponse.not_found(f"Print job {job_id} not found")
             return response.to_dict()
 
-        # Job state values:
-        # 3 = pending, 4 = pending-held, 5 = processing,
-        # 6 = processing-stopped, 7 = canceled, 8 = aborted, 9 = completed
         job_state = job.get("job-state", 0)
-        state_map = {
-            3: "pending",
-            4: "pending-held",
-            5: "processing",
-            6: "processing-stopped",
-            7: "canceled",
-            8: "aborted",
-            9: "completed",
-        }
 
         # Parse the printer name out of job-printer-uri
         # Format: ipp://localhost/printers/Canon_G5080_series_2
-        printer_name = ""
-        printer_uri = job.get("job-printer-uri", "") or job.get("printer-uri", "")
-        if printer_uri and "/printers/" in printer_uri:
-            printer_name = printer_uri.split("/printers/")[-1]
+        printer_name = job_printer_name(job)
 
         response = APIResponse.success(
             {
                 "job_id": job_id,
                 "printer_name": printer_name,
-                "job_name": job.get("document-name-supplied", job.get("job-name", "")),
-                "job_state": state_map.get(job_state, "unknown"),
+                "job_name": job_display_name(job),
+                "job_state": JOB_STATE_MAP.get(job_state, "unknown"),
                 "job_state_reasons": job.get("job-state-reasons", []),
                 "time_at_creation": job.get("time-at-creation", 0),
                 "time_at_processing": job.get("time-at-processing", 0),
