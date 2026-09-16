@@ -302,7 +302,62 @@ def detect_format(path: str) -> Tuple[str, str]:
         if sniffed in (KIND_NATIVE, KIND_IMAGE, KIND_OFFICE):
             return sniffed, "magic-override"
 
+    # A "native" extension goes to the printer untouched, so it must really
+    # be a PDF/PostScript: an HTML error page saved as .pdf, or plain text
+    # saved as .ps, would otherwise print as garbage (or not at all).
+    if ext_kind == KIND_NATIVE and not _has_native_magic(path, ext):
+        sniffed = sniff_format(path)
+        if sniffed == KIND_NATIVE:  # pragma: no cover - defensive
+            return sniffed, "extension"
+        return sniffed, "magic-override"
+
     return ext_kind, "extension"
+
+
+def _looks_like_pdf(path: str) -> bool:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(4) == b"%PDF"
+    except OSError:
+        return False
+
+
+def _has_native_magic(path: str, ext: str) -> bool:
+    """True when a .pdf/.ps/.prn file starts with the bytes its name promises."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(16)
+    except OSError:
+        return False
+    if ext == ".pdf":
+        return head.startswith(b"%PDF")
+    if head.startswith(b"%!") or head.startswith(b"\x04%!"):
+        return True  # PostScript, possibly with a leading ^D
+    if ext == ".prn":
+        # Captured printer streams: PJL universal exit language or a PCL reset.
+        return head.startswith(b"\x1b%-12345X") or head.startswith(b"\x1bE")
+    return False
+
+
+#: How much of a PDF's tail to scan for the trailer's /Encrypt entry.
+_PDF_TRAILER_WINDOW = 2048
+
+
+def pdf_is_encrypted(path: str) -> bool:
+    """Heuristic: does this PDF's trailer reference an /Encrypt dictionary?
+
+    Not a PDF parser - it looks for ``/Encrypt`` in the last couple of
+    kilobytes, which is where the trailer (or the cross-reference stream
+    dictionary) of an encrypted file lives.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            handle.seek(max(0, size - _PDF_TRAILER_WINDOW))
+            tail = handle.read(_PDF_TRAILER_WINDOW)
+    except OSError:
+        return False
+    return b"/Encrypt" in tail
 
 
 # ==================== page geometry ====================
@@ -1069,20 +1124,132 @@ class OfficeConverter(BaseConverter):
     #: never run, whatever the user's Trust Center says.
     AUTOMATION_SECURITY_FORCE_DISABLE = 3
 
+    #: Top-level window class of each Office application, used to find the
+    #: process behind a COM server so a hung one can be killed by PID.
+    OFFICE_WINDOW_CLASSES = {
+        "Word.Application": "OpusApp",
+        "Excel.Application": "XLMAIN",
+        "PowerPoint.Application": "PPTFrameClass",
+    }
+
+    @classmethod
+    def _office_window_pids(cls, prog_id: str) -> set:
+        """PIDs of every process owning a top-level window of ``prog_id``'s class.
+
+        Best effort: returns an empty set when the win32 modules are missing
+        or enumeration fails.
+        """
+        wanted = cls.OFFICE_WINDOW_CLASSES.get(prog_id)
+        if not wanted:
+            return set()
+        try:
+            import win32gui
+            import win32process
+        except Exception as exc:  # pragma: no cover - only off Windows
+            logger.debug("win32gui/win32process unavailable: %s", exc)
+            return set()
+
+        pids: set = set()
+
+        def visit(hwnd, _extra):
+            try:
+                if win32gui.GetClassName(hwnd) == wanted:
+                    pids.add(win32process.GetWindowThreadProcessId(hwnd)[1])
+            except Exception:  # a window may vanish mid-enumeration
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(visit, None)
+        except Exception as exc:
+            logger.debug("EnumWindows failed: %s", exc)
+        return pids
+
+    @classmethod
+    def _office_pid(cls, app: Any, prog_id: str, pids_before: set) -> Optional[int]:
+        """Work out the process id behind a freshly started Office COM server.
+
+        Excel and PowerPoint expose ``Hwnd``; Word does not, so the fallback
+        is to find a top-level window of the application's class owned by a
+        process that did not exist before ``DispatchEx``.
+        """
+        hwnd = None
+        try:
+            hwnd = getattr(app, "Hwnd", None)
+        except Exception:  # COM property may throw on a wedged server
+            hwnd = None
+        if hwnd:
+            try:
+                import win32process
+
+                return int(win32process.GetWindowThreadProcessId(hwnd)[1])
+            except Exception as exc:
+                logger.debug("GetWindowThreadProcessId(%r) failed: %s", hwnd, exc)
+
+        fresh = cls._office_window_pids(prog_id) - set(pids_before)
+        if fresh:
+            return int(sorted(fresh)[0])
+        return None
+
+    @staticmethod
+    def _terminate_pid(pid: int) -> bool:
+        """Kill ``pid`` outright via the Win32 API; True when it was signalled.
+
+        Used only for an Office instance that has stopped responding to COM.
+        ``Quit()`` cannot be used for that: the object lives in the worker
+        thread's apartment and calling it from another thread either fails
+        with RPC_E_WRONG_THREAD or blocks on the hung message pump.
+        """
+        try:
+            import win32api
+            import win32process
+        except Exception as exc:  # pragma: no cover - only off Windows
+            logger.warning("cannot terminate pid %s: %s", pid, exc)
+            return False
+        PROCESS_TERMINATE = 0x0001
+        try:
+            handle = win32api.OpenProcess(PROCESS_TERMINATE, False, pid)
+        except Exception as exc:
+            logger.warning("OpenProcess(%s) failed: %s", pid, exc)
+            return False
+        try:
+            win32process.TerminateProcess(handle, 1)
+            return True
+        except Exception as exc:
+            logger.warning("TerminateProcess(%s) failed: %s", pid, exc)
+            return False
+        finally:
+            try:
+                win32api.CloseHandle(handle)
+            except Exception:  # pragma: no cover - best effort
+                pass
+
+    def _dispatch(self, prog_id: str, state: Dict[str, Any]) -> Any:
+        """``DispatchEx`` plus bookkeeping so a hung server can be killed later."""
+        import win32com.client
+
+        pids_before = self._office_window_pids(prog_id)
+        app = win32com.client.DispatchEx(prog_id)
+        state["app"] = app
+        state["prog_id"] = prog_id
+        try:
+            state["pid"] = self._office_pid(app, prog_id, pids_before)
+        except Exception as exc:  # never let bookkeeping break the conversion
+            logger.debug("could not determine the %s pid: %s", prog_id, exc)
+            state["pid"] = None
+        return app
+
     def _com_export(self, ext: str, source: str, target: str,
                     state: Dict[str, Any]) -> None:
         """The COM conversion proper; runs inside the worker thread.
 
-        ``state["app"]`` is set as soon as the application exists so the
-        caller can ``Quit()`` it if this thread never returns. Macros are
+        ``state["pid"]`` is set as soon as the application exists so the
+        caller can terminate it if this thread never returns. Macros are
         disabled before any document is opened, and every open uses flags
         that never prompt, repair, convert or touch the recent-files list.
         """
-        import win32com.client
-
         if ext in self.WORD_EXTENSIONS:
-            app = win32com.client.DispatchEx("Word.Application")
-            state["app"] = app
+            app = self._dispatch("Word.Application", state)
             try:
                 app.AutomationSecurity = self.AUTOMATION_SECURITY_FORCE_DISABLE
                 app.Visible = False
@@ -1102,8 +1269,7 @@ class OfficeConverter(BaseConverter):
             finally:
                 app.Quit()
         elif ext in self.EXCEL_EXTENSIONS:
-            app = win32com.client.DispatchEx("Excel.Application")
-            state["app"] = app
+            app = self._dispatch("Excel.Application", state)
             try:
                 app.AutomationSecurity = self.AUTOMATION_SECURITY_FORCE_DISABLE
                 app.Visible = False
@@ -1118,8 +1284,7 @@ class OfficeConverter(BaseConverter):
             finally:
                 app.Quit()
         elif ext in self.POWERPOINT_EXTENSIONS:
-            app = win32com.client.DispatchEx("PowerPoint.Application")
-            state["app"] = app
+            app = self._dispatch("PowerPoint.Application", state)
             try:
                 app.AutomationSecurity = self.AUTOMATION_SECURITY_FORCE_DISABLE
                 presentation = app.Presentations.Open(
@@ -1165,7 +1330,8 @@ class OfficeConverter(BaseConverter):
                 f"no Microsoft Office application handles '{ext}'", code=415
             )
 
-        state: Dict[str, Any] = {"app": None, "error": None}
+        state: Dict[str, Any] = {"app": None, "error": None, "pid": None,
+                                 "prog_id": None}
 
         def worker() -> None:
             import pythoncom as _pythoncom
@@ -1188,15 +1354,20 @@ class OfficeConverter(BaseConverter):
         thread.start()
         thread.join(timeout)
         if thread.is_alive():
-            # The worker is stuck inside Office. Quit the application so it
-            # does not linger as an invisible process; the daemon thread is
+            # The worker is stuck inside Office. The COM object belongs to
+            # the worker's apartment, so Quit() from here would fail or hang;
+            # kill the process by PID instead so it does not linger as an
+            # invisible WINWORD/EXCEL/POWERPNT. The daemon thread is
             # abandoned (it dies with the interpreter).
-            app = state.get("app")
-            if app is not None:
-                try:
-                    app.Quit()
-                except Exception:  # pragma: no cover - Office may be wedged
-                    logger.warning("could not quit the hung Office application")
+            pid = state.get("pid")
+            killed = False
+            if pid:
+                killed = self._terminate_pid(pid)
+            if not killed:
+                logger.warning(
+                    "hung %s (pid %s) could not be terminated; it may linger",
+                    state.get("prog_id") or "Office application", pid,
+                )
             raise ConversionError(
                 f"Office COM conversion timed out after {timeout:.0f}s",
                 hint=(
@@ -1224,8 +1395,20 @@ class OfficeConverter(BaseConverter):
                     notes.append("converted by Microsoft Office (COM)")
                     return target
                 logger.warning("Office COM reported success but wrote no file")
-            except ConversionError:
-                raise
+            except ConversionError as exc:
+                # A hung (504) or crashed (500) Office is a problem with the
+                # tool, not the document: give LibreOffice a turn when it is
+                # installed. Document problems (415/422) are final.
+                if exc.code in (504, 500) and find_soffice():
+                    logger.warning(
+                        "Office COM failed (%s), trying LibreOffice", exc
+                    )
+                    notes.append(
+                        "Office COM failed/timed out; converted via "
+                        f"LibreOffice instead ({exc})"
+                    )
+                else:
+                    raise
             except Exception as exc:
                 logger.warning("Office COM conversion failed (%s), trying LibreOffice", exc)
                 notes.append(f"Microsoft Office was unusable ({exc}); used LibreOffice")
@@ -1390,6 +1573,19 @@ def to_pdf(path: str, out_dir: Optional[str] = None) -> ConvertResult:
         )
 
     if isinstance(converter, PassthroughConverter):
+        if _looks_like_pdf(path) and pdf_is_encrypted(path):
+            raise ConversionError(
+                "password-protected or encrypted PDF",
+                hint=(
+                    "The printer cannot open an encrypted PDF. Remove the "
+                    "password (e.g. print/export it to a new PDF from a viewer "
+                    "after entering the password) and print the result."
+                ),
+                source_path=path,
+                detected=kind,
+                converter=converter.name,
+                code=422,
+            )
         return ConvertResult(
             pdf_path=os.path.abspath(path),
             source_path=os.path.abspath(path),

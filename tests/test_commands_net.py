@@ -17,6 +17,38 @@ from local_printer import discovery
 from local_printer import setup_windows as sw
 
 
+@pytest.fixture(autouse=True)
+def _no_real_io(monkeypatch):
+    """Fail fast if a test reaches the wire or the spooler without stubbing it.
+
+    `cn.setup` on non-Windows hosts goes through `_setup_cups`, which calls
+    `discovery.ipp_query` (multi-second socket timeouts) and then `lpadmin`.
+    Tests that want these seams patch them explicitly on top of this fixture;
+    anything that forgets gets an AssertionError instead of a 48s DNS wait or
+    a real queue being installed.
+    """
+    import subprocess
+
+    def _unpatched(name):
+        def _raise(*args, **kwargs):
+            raise AssertionError(f"{name} reached real I/O; patch it in the test")
+        return _raise
+
+    monkeypatch.setattr(discovery, "ipp_query", _unpatched("discovery.ipp_query"))
+    monkeypatch.setattr(discovery, "probe_ports", _unpatched("discovery.probe_ports"))
+    monkeypatch.setattr(discovery, "scan_subnet", _unpatched("discovery.scan_subnet"))
+
+    real_run = subprocess.run
+
+    def guarded_run(cmd, *args, **kwargs):
+        head = str(cmd[0] if isinstance(cmd, (list, tuple)) and cmd else cmd)
+        if os.path.basename(head) in {"lpadmin", "lp", "lpr", "lpstat", "cancel"}:
+            raise AssertionError(f"test tried to run real {head!r}; patch subprocess.run")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", guarded_run)
+
+
 # ------------------------------------------------------------------- discover
 
 
@@ -309,7 +341,9 @@ def test_setup_forwards_vendor_lookup_and_maps_error_to_500(monkeypatch):
         captured["dry_run"] = dry_run
         return {"error": "every setup strategy failed"}
 
-    monkeypatch.setattr(sw, "setup_printer", fake_setup_printer)
+    # This exercises the Windows branch of cn.setup; on Linux/macOS the call
+    # would otherwise fall through to _setup_cups and hit the network.
+    _patch_windows_setup(monkeypatch, fake_setup_printer)
 
     result = cn.setup("10.0.0.5", vendor_lookup=True)
 
@@ -323,7 +357,167 @@ def test_setup_success_maps_to_200(monkeypatch):
     def fake_setup_printer(host, name=None, allow_generic=True, dry_run=False, vendor_lookup=False):
         return {"printer": "Foo", "installed_with": {"kind": "raw-fallback"}}
 
-    monkeypatch.setattr(sw, "setup_printer", fake_setup_printer)
+    _patch_windows_setup(monkeypatch, fake_setup_printer)
 
     result = cn.setup("10.0.0.5", vendor_lookup=False)
     assert result["code"] == 200
+
+
+# ------------------------------------------------------- setup: CUPS branch
+
+
+_IDENTITY = {
+    "host": "10.0.0.5", "ipp_path": "/ipp/print", "ipp_port": 631, "ipp_tls": False,
+    "ipp_uri": "ipp://10.0.0.5:631/ipp/print", "make_and_model": "EPSON ET-4850",
+}
+
+
+def _patch_cups_setup(monkeypatch, identity, run_result=None, calls=None):
+    """Route cn.setup through _setup_cups with IPP and lpadmin stubbed out."""
+    import subprocess
+
+    monkeypatch.setattr(cn, "IS_WINDOWS", False)
+    monkeypatch.setattr(discovery, "ipp_query", lambda host, timeout=3.0: identity)
+
+    def fake_run(cmd, *args, **kwargs):
+        if calls is not None:
+            calls.append(list(cmd))
+        return run_result or subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+
+def test_setup_cups_host_without_ipp_is_404(monkeypatch):
+    calls = []
+    _patch_cups_setup(monkeypatch, identity=None, calls=calls)
+
+    result = cn.setup("10.0.0.5")
+
+    assert result["code"] == 404
+    assert "does not answer IPP" in result["msg"]
+    assert calls == []
+
+
+def test_setup_cups_dry_run_reports_command_and_runs_nothing(monkeypatch):
+    calls = []
+    _patch_cups_setup(monkeypatch, identity=_IDENTITY, calls=calls)
+
+    result = cn.setup("10.0.0.5", dry_run=True)
+
+    assert result["code"] == 200
+    assert result["data"]["identity"] == _IDENTITY
+    assert result["data"]["would_run"].startswith("lpadmin -p EPSON_ET-4850 -E -v ipp://10.0.0.5:631/ipp/print")
+    assert calls == []
+
+
+def test_setup_cups_runs_lpadmin_with_sanitised_queue_name(monkeypatch):
+    calls = []
+    _patch_cups_setup(monkeypatch, identity=_IDENTITY, calls=calls)
+
+    result = cn.setup("10.0.0.5", name="Office Printer #2")
+
+    assert result["code"] == 200
+    assert result["data"]["printer"] == "Office_Printer__2"
+    assert result["data"]["installed_with"] == {"kind": "ipp-everywhere", "driver": "everywhere"}
+    assert calls == [[
+        "lpadmin", "-p", "Office_Printer__2", "-E", "-v", "ipp://10.0.0.5:631/ipp/print",
+        "-m", "everywhere",
+    ]]
+
+
+def test_setup_cups_lpadmin_failure_is_500_with_stderr(monkeypatch):
+    import subprocess
+
+    failed = subprocess.CompletedProcess([], 1, stdout="", stderr="lpadmin: Bad device-uri\n")
+    _patch_cups_setup(monkeypatch, identity=_IDENTITY, run_result=failed)
+
+    result = cn.setup("10.0.0.5")
+
+    assert result["code"] == 500
+    assert "Bad device-uri" in result["msg"]
+    assert result["data"]["command"].startswith("lpadmin ")
+
+
+# ------------------------------------------------- setup error -> HTTP code (R2-19)
+
+
+def _patch_windows_setup(monkeypatch, fake_setup_printer):
+    """Route cn.setup through the Windows branch with setup_printer stubbed out.
+
+    On non-Windows hosts cn.IS_WINDOWS is False and cn._setup is None, so
+    without this the call would fall into _setup_cups and hit the network.
+    """
+    monkeypatch.setattr(cn, "IS_WINDOWS", True)
+    monkeypatch.setattr(cn, "_setup", sw, raising=False)
+    monkeypatch.setattr(sw, "setup_printer", fake_setup_printer)
+
+
+@pytest.mark.parametrize("error, expected", [
+    ("invalid host", 400),
+    ("invalid printer name: must be a non-empty string", 400),
+    ("invalid printer name: longer than 220 characters", 400),
+    ("no printing port (9100/631/515) open on this host", 404),
+    ("host unreachable", 404),
+    ("10.0.0.5 does not answer IPP", 404),
+    ("printer not found", 404),
+    ("every setup strategy failed", 500),
+    ("driver install failed: access denied", 500),
+    ("something nobody anticipated", 500),
+    ("", 500),
+    (None, 500),
+])
+def test_setup_error_code_helper(error, expected):
+    assert cn._setup_error_code(error) == expected
+
+
+def test_setup_error_code_is_case_insensitive():
+    assert cn._setup_error_code("Invalid Host") == 400
+    assert cn._setup_error_code("No Printing Port open") == 404
+
+
+@pytest.mark.parametrize("payload, expected_code", [
+    ({"host": "not a host", "reachable": False, "error": "invalid host"}, 400),
+    (
+        {"host": "10.0.0.5", "reachable": False,
+         "error": "no printing port (9100/631/515) open on this host"},
+        404,
+    ),
+    (
+        {"host": "10.0.0.5", "printer": "bad|name", "installed_with": None,
+         "attempts": [], "error": "invalid printer name: must not contain '|' (Windows forbids it)",
+         "hint": "pass a usable queue name with --name"},
+        400,
+    ),
+    (
+        {"host": "10.0.0.5", "printer": "Foo", "installed_with": None,
+         "attempts": [{"status": "failed", "detail": "driver install failed: x"}],
+         "error": "every setup strategy failed"},
+        500,
+    ),
+])
+def test_setup_maps_error_shapes_to_codes(monkeypatch, payload, expected_code):
+    def fake_setup_printer(host, name=None, allow_generic=True, dry_run=False, vendor_lookup=False):
+        return payload
+
+    _patch_windows_setup(monkeypatch, fake_setup_printer)
+
+    result = cn.setup(payload["host"])
+
+    assert result["code"] == expected_code
+    assert result["msg"] == payload["error"]
+    assert result["data"] == payload
+
+
+def test_setup_without_error_still_returns_200(monkeypatch):
+    payload = {"host": "10.0.0.5", "printer": "Foo", "installed_with": {"kind": "raw-fallback"}}
+
+    def fake_setup_printer(host, name=None, allow_generic=True, dry_run=False, vendor_lookup=False):
+        return payload
+
+    _patch_windows_setup(monkeypatch, fake_setup_printer)
+
+    result = cn.setup("10.0.0.5")
+
+    assert result["code"] == 200
+    assert result["msg"] == "success"
+    assert result["data"] == payload

@@ -166,6 +166,89 @@ def get_print_options_format():
 
 
 
+def _status_bit(name: str, default: int) -> int:
+    """PRINTER_STATUS_* from win32print, or the WINSPOOL.H value if pywin32
+    does not export that constant on this build."""
+    return getattr(win32print, name, default)
+
+
+def classify_printer_status(status_bits: int):
+    """Map a PRINTER_INFO_2.Status bitmask to (status, reasons, is_accepting).
+
+    Three buckets, in priority order:
+
+    * **stopped, not accepting** - the queue would only swallow the job:
+      paused, error, offline, paper out, paper jam, door open, no toner,
+      user intervention, not available, server unknown, power save (the
+      spooler reports the device unreachable), page punt, out of memory.
+      ``toner-low`` is merely reported as a reason: the printer still prints.
+    * **processing** - busy, printing, I/O active, warming up, initialising,
+      processing, waiting.
+    * **idle** - nothing set.
+
+    Anything else that is set but not understood is left as ``unknown``.
+    """
+    bits = int(status_bits or 0)
+    if bits == 0:
+        return PrinterStatus.IDLE, [], True
+
+    stop_reasons = [
+        ("PRINTER_STATUS_PAUSED", 0x00000001, "paused"),
+        ("PRINTER_STATUS_ERROR", 0x00000002, "error"),
+        ("PRINTER_STATUS_OFFLINE", 0x00000080, "offline"),
+        ("PRINTER_STATUS_PAPER_JAM", 0x00000008, "paper-jam"),
+        ("PRINTER_STATUS_PAPER_OUT", 0x00000010, "out-of-paper"),
+        ("PRINTER_STATUS_PAPER_PROBLEM", 0x00000040, "paper-problem"),
+        ("PRINTER_STATUS_MANUAL_FEED", 0x00000020, "manual-feed"),
+        ("PRINTER_STATUS_DOOR_OPEN", 0x00400000, "door-open"),
+        ("PRINTER_STATUS_NO_TONER", 0x00040000, "no-toner"),
+        ("PRINTER_STATUS_OUTPUT_BIN_FULL", 0x00000800, "output-bin-full"),
+        ("PRINTER_STATUS_NOT_AVAILABLE", 0x00001000, "not-available"),
+        ("PRINTER_STATUS_USER_INTERVENTION", 0x00100000, "user-intervention"),
+        ("PRINTER_STATUS_OUT_OF_MEMORY", 0x00200000, "out-of-memory"),
+        ("PRINTER_STATUS_SERVER_UNKNOWN", 0x00800000, "server-unknown"),
+        ("PRINTER_STATUS_PAGE_PUNT", 0x00080000, "page-punt"),
+    ]
+    busy_reasons = [
+        ("PRINTER_STATUS_BUSY", 0x00000200, "busy"),
+        ("PRINTER_STATUS_PRINTING", 0x00000400, "printing"),
+        ("PRINTER_STATUS_IO_ACTIVE", 0x00000100, "io-active"),
+        ("PRINTER_STATUS_WARMING_UP", 0x00010000, "warming-up"),
+        ("PRINTER_STATUS_INITIALIZING", 0x00008000, "initializing"),
+        ("PRINTER_STATUS_PROCESSING", 0x00004000, "processing"),
+        ("PRINTER_STATUS_WAITING", 0x00002000, "waiting"),
+        ("PRINTER_STATUS_PENDING_DELETION", 0x00000004, "pending-deletion"),
+    ]
+    advisory_reasons = [
+        ("PRINTER_STATUS_TONER_LOW", 0x00020000, "toner-low"),
+        ("PRINTER_STATUS_POWER_SAVE", 0x01000000, "power-save"),
+    ]
+
+    reasons: List[str] = []
+    stopped = False
+    busy = False
+    for name, default, reason in stop_reasons:
+        if bits & _status_bit(name, default):
+            reasons.append(reason)
+            stopped = True
+    for name, default, reason in busy_reasons:
+        if bits & _status_bit(name, default):
+            reasons.append(reason)
+            busy = True
+    for name, default, reason in advisory_reasons:
+        if bits & _status_bit(name, default):
+            reasons.append(reason)
+
+    if stopped:
+        return PrinterStatus.STOPPED, reasons, False
+    if busy:
+        return PrinterStatus.PROCESSING, reasons, True
+    if reasons:
+        # Only advisory bits (toner low, power save): still prints.
+        return PrinterStatus.IDLE, reasons, True
+    return PrinterStatus.UNKNOWN, reasons, True
+
+
 def get_printer_list() -> Dict[str, Any]:
     """Get the list of printers on Windows"""
     try:
@@ -203,35 +286,9 @@ def get_printer_list() -> Dict[str, Any]:
                 is_accepting = True
 
                 # Set status based on printer state
-                if printer_info["Status"] == 0:
-                    status = PrinterStatus.IDLE
-                elif printer_info["Status"] & win32print.PRINTER_STATUS_BUSY:
-                    status = PrinterStatus.PROCESSING
-                elif printer_info["Status"] & (
-                    win32print.PRINTER_STATUS_ERROR
-                    | win32print.PRINTER_STATUS_OFFLINE
-                    | win32print.PRINTER_STATUS_PAUSED
-                ):
-                    status = PrinterStatus.STOPPED
-                    is_accepting = False
-
-                # Get status reasons
-                if printer_info["Status"] & win32print.PRINTER_STATUS_PAUSED:
-                    status_reasons.append("paused")
-                if printer_info["Status"] & win32print.PRINTER_STATUS_ERROR:
-                    status_reasons.append("error")
-                if printer_info["Status"] & win32print.PRINTER_STATUS_OFFLINE:
-                    status_reasons.append("offline")
-                if printer_info["Status"] & win32print.PRINTER_STATUS_PAPER_OUT:
-                    status_reasons.append("out-of-paper")
-                if printer_info["Status"] & win32print.PRINTER_STATUS_PAPER_JAM:
-                    status_reasons.append("paper-jam")
-                if printer_info["Status"] & win32print.PRINTER_STATUS_DOOR_OPEN:
-                    status_reasons.append("door-open")
-                if printer_info["Status"] & win32print.PRINTER_STATUS_TONER_LOW:
-                    status_reasons.append("toner-low")
-                if printer_info["Status"] & win32print.PRINTER_STATUS_NO_TONER:
-                    status_reasons.append("no-toner")
+                status, status_reasons, is_accepting = classify_printer_status(
+                    printer_info["Status"]
+                )
 
                 # "Use Printer Offline" (the queue-level toggle in the Windows
                 # printer menu) is NOT reflected in Status: the spooler records
@@ -957,6 +1014,13 @@ def _print_pdf_gdi(printer_name: str, port: str, file_path: str,
         offset_y = dc.GetDeviceCaps(win32con.PHYSICALOFFSETY)
 
         dpi = win_render.resolve_render_dpi(min(logical_dpi_x, logical_dpi_y))
+        # A per-inch cap alone still lets a poster-sized page allocate a huge
+        # bitmap; bound the total pixel count as well.
+        dpi = win_render.bound_dpi_by_pixels(
+            dpi,
+            win_render.device_units_to_inches(physical_w, logical_dpi_x),
+            win_render.device_units_to_inches(physical_h, logical_dpi_y),
+        )
         scale = dpi / 72.0
 
         title = os.path.basename(file_path) or "printer-ai"

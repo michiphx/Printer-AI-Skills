@@ -30,8 +30,9 @@ import struct
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from utils.logger import logger
 
@@ -605,6 +606,10 @@ def _uri_hostname(text: str) -> Tuple[Optional[str], Optional[str]]:
         hostname = parts.hostname
     except ValueError:  # malformed IPv6 bracket / port
         hostname = None
+    if hostname:
+        # A link-local IPv6 zone index is written ``fe80::1%25eth0`` in a URI
+        # (RFC 6874); ipaddress/getaddrinfo want the decoded ``fe80::1%eth0``.
+        hostname = unquote(hostname)
     return scheme, (hostname or None)
 
 
@@ -627,17 +632,36 @@ def host_of(text: Optional[str]) -> Optional[str]:
     return match.group(0) if match else None
 
 
-def _resolve_hostname(hostname: str) -> Optional[str]:
+# getaddrinfo has no timeout of its own: a ``.local`` name that does not answer
+# can block for the OS resolver's full retry budget (often 10-20 s) and the
+# diagnose path resolves each queue serially.  3.0 s matches the IPP query
+# default in this module and comfortably covers a cold mDNS lookup.
+DEFAULT_RESOLVE_TIMEOUT = 3.0
+
+
+def _resolve_hostname(hostname: str, timeout: float = DEFAULT_RESOLVE_TIMEOUT) -> Optional[str]:
     """DNS/mDNS-resolve `hostname` to an address; None when it does not resolve.
 
     Prefers an IPv4 answer when there is one, since that is what the rest of
     the probing stack is exercised against, else takes the first answer.
+
+    The lookup runs on a worker thread and is abandoned after `timeout`
+    seconds, which counts as a resolution failure.  The executor is shut down
+    without waiting so a hung resolver thread cannot hold up the caller.
     """
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="resolve")
     try:
-        infos = socket.getaddrinfo(hostname, None)
+        future = pool.submit(socket.getaddrinfo, hostname, None)
+        infos = future.result(timeout=timeout)
+    except FutureTimeoutError:
+        logger.debug(f"getaddrinfo({hostname!r}) timed out after {timeout}s")
+        future.cancel()
+        return None
     except (socket.gaierror, OSError) as exc:
         logger.debug(f"getaddrinfo({hostname!r}) failed: {exc}")
         return None
+    finally:
+        pool.shutdown(wait=False)
     first: Optional[str] = None
     for family, _type, _proto, _canon, sockaddr in infos:
         address = sockaddr[0] if sockaddr else None
@@ -649,8 +673,13 @@ def _resolve_hostname(hostname: str) -> Optional[str]:
     return first
 
 
-def resolve_host(text: Optional[str]) -> Optional[Dict[str, Any]]:
+def resolve_host(
+    text: Optional[str], timeout: float = DEFAULT_RESOLVE_TIMEOUT
+) -> Optional[Dict[str, Any]]:
     """Work out which address, if any, a port name / URI / location points at.
+
+    `timeout` bounds the hostname lookup (see `_resolve_hostname`); literal
+    addresses never touch the resolver.
 
     Returns None when the text names no network host at all (``file://``,
     ``cups-pdf:``, ``usb://``, ``nul:``, a WSD port, plain free text).
@@ -680,7 +709,7 @@ def resolve_host(text: Optional[str]) -> Optional[Dict[str, Any]]:
         return {"hostname": hostname or literal, "address": literal, "reason": None}
     if not hostname:
         return None
-    address = _resolve_hostname(hostname)
+    address = _resolve_hostname(hostname, timeout=timeout)
     if address:
         return {"hostname": hostname, "address": address, "reason": None}
     return {

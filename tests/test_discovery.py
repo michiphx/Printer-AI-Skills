@@ -2,6 +2,8 @@
 
 import sys
 import struct
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -408,6 +410,58 @@ class TestResolveHost:
         result = discovery.resolve_host("dnssd://EPSON%20ET-4850._ipp._tcp.local/?uuid=abc")
         assert result["address"] is None
         assert "DNS-SD" in result["reason"]
+
+    def test_hung_resolver_is_unresolved_within_timeout(self, monkeypatch):
+        # A .local name that never answers must not stall diagnose for the OS
+        # resolver's full retry budget.  The fake lookup blocks on an event so
+        # the worker thread is released at the end of the test rather than
+        # holding up interpreter shutdown.
+        release = threading.Event()
+
+        def hung_gai(host, port, *args, **kwargs):
+            if not release.wait(5.0):
+                raise discovery.socket.gaierror(-3, "Temporary failure in name resolution")
+            return [(discovery.socket.AF_INET, 1, 6, "", ("192.168.1.72", 0))]
+
+        monkeypatch.setattr(discovery.socket, "getaddrinfo", hung_gai)
+        try:
+            started = time.monotonic()
+            result = discovery.resolve_host("ipp://ghost.local:631/ipp/print", timeout=0.2)
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+        assert elapsed < 2.0, f"resolve_host blocked for {elapsed:.2f}s"
+        assert result["address"] is None
+        assert result["hostname"] == "ghost.local"
+        assert "does not resolve" in result["reason"]
+
+    def test_resolve_timeout_default_is_bounded(self):
+        assert 0 < discovery.DEFAULT_RESOLVE_TIMEOUT <= 5.0
+
+    def test_percent_encoded_ipv6_zone_is_literal(self, monkeypatch):
+        # RFC 6874 writes a zone index as %25 inside the URI; the decoded form
+        # is a valid IPv6 literal and must not go anywhere near the resolver.
+        monkeypatch.setattr(discovery.socket, "getaddrinfo", _failing_getaddrinfo)
+        encoded = discovery.resolve_host("ipp://[fe80::1%25eth0]:631/ipp/print")
+        plain = discovery.resolve_host("ipp://[fe80::1%eth0]:631/ipp/print")
+        assert encoded == plain
+        assert encoded["address"] == "fe80::1%eth0"
+        assert encoded["reason"] is None
+        assert discovery.host_of("ipp://[fe80::1%25eth0]:631/") == "fe80::1%eth0"
+
+    def test_percent_encoded_hostname_is_decoded_before_lookup(self, monkeypatch):
+        seen = []
+
+        def gai(host, port, *args, **kwargs):
+            seen.append(host)
+            return [(discovery.socket.AF_INET, 1, 6, "", ("192.168.1.72", 0))]
+
+        monkeypatch.setattr(discovery.socket, "getaddrinfo", gai)
+        encoded = discovery.resolve_host("ipp://my%2Dprinter.local:631/ipp/print")
+        plain = discovery.resolve_host("ipp://my-printer.local:631/ipp/print")
+        assert seen == ["my-printer.local", "my-printer.local"]
+        assert encoded == plain
+        assert encoded["hostname"] == "my-printer.local"
 
 
 # --------------------------------------------------------------- scan_subnet

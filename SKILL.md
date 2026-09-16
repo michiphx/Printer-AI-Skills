@@ -115,6 +115,14 @@ A successful result carries `job_id`, `printer_name`, `file_path`, plus
 conversion happened. On Windows it also carries `method` (`"gdi"` or `"raw"`),
 `pages`, `dpi`, `copies` and `copies_handled_by`.
 
+By default success is printed as short human-readable text. Add `--json` when
+you want to parse the outcome mechanically: it prints the full
+`{"code","msg","data"}` result on success too (failures are always JSON).
+
+```bash
+printer-ai print report.docx --json   # {"code":200,"data":{"job_id":..,"converter":..,"conversion_notes":[..]}}
+```
+
 **When a `415` comes back**, the conversion tool for that format is missing —
 this is not the user's fault and not a reason to give up. The result already
 carries `data.hint`; run `printer-ai formats` for the whole picture and relay

@@ -237,6 +237,47 @@ class TestCmdPrint:
         assert fake_backend.calls[0]["file_path"] == str(source)
         assert source.exists()
 
+    def test_json_flag_prints_the_full_result_on_success(
+        self, fake_backend, tmp_path, capsys
+    ):
+        source = tmp_path / "doc.pdf"
+        source.write_bytes(b"%PDF-1.4\n%stuff\n")
+
+        run_cli(["print", str(source), "--json"])
+
+        out = capsys.readouterr().out
+        assert "Print job submitted" not in out
+        result = json.loads(out)
+        assert result["code"] == 200
+        data = result["data"]
+        assert data["job_id"] == 42
+        assert data["printer_name"] == "Fake-Printer"
+        assert data["converter"] == "passthrough"
+        assert data["converted"] is False
+        assert data["conversion_notes"]
+
+    def test_json_flag_carries_conversion_details(self, fake_backend, tmp_path, capsys):
+        pytest.importorskip("reportlab")
+        source = tmp_path / "notes.txt"
+        source.write_text("hello\n")
+
+        run_cli(["print", str(source), "--json"])
+
+        result = json.loads(capsys.readouterr().out)
+        data = result["data"]
+        assert data["converted"] is True
+        assert data["converted_from"] == str(source)
+        assert data["converter"] == "text"
+
+    def test_default_output_stays_human_readable(self, fake_backend, tmp_path, capsys):
+        source = tmp_path / "doc.pdf"
+        source.write_bytes(b"%PDF-1.4\n%stuff\n")
+        run_cli(["print", str(source)])
+        out = capsys.readouterr().out
+        assert "Print job submitted" in out
+        with pytest.raises(ValueError):
+            json.loads(out)
+
     def test_raw_skips_conversion(self, fake_backend, tmp_path, capsys):
         source = tmp_path / "job.prn"
         source.write_bytes(b"\x1b%-12345X@PJL\n")

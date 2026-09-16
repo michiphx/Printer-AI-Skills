@@ -96,6 +96,8 @@ class FakeWin32Print:
     PRINTER_STATUS_DOOR_OPEN = 0x400000
     PRINTER_STATUS_TONER_LOW = 0x20000
     PRINTER_STATUS_NO_TONER = 0x40000
+    # PRINTING (0x400) and IO_ACTIVE (0x100) are deliberately NOT exported so
+    # the WINSPOOL.H fallback in windows.classify_printer_status is exercised.
 
     def __init__(self, calls, devmode, dc_copies=1):
         self.calls = calls
@@ -795,6 +797,151 @@ def test_raw_print_is_also_refused_on_offline_printer(win):
     assert result["code"] == 503, result
     assert win.win32print.written == []
     _assert_nothing_touched_the_device(win.calls)
+
+
+# ------------------------------------------- status bit classification (R2-05)
+
+PRINTER_STATUS_PRINTING = 0x400     # WINSPOOL.H; not exported by the fake
+PRINTER_STATUS_IO_ACTIVE = 0x100
+
+
+@pytest.mark.parametrize(
+    "bits, reason",
+    [
+        (FakeWin32Print.PRINTER_STATUS_PAPER_OUT, "out-of-paper"),
+        (FakeWin32Print.PRINTER_STATUS_PAPER_JAM, "paper-jam"),
+        (FakeWin32Print.PRINTER_STATUS_DOOR_OPEN, "door-open"),
+        (FakeWin32Print.PRINTER_STATUS_NO_TONER, "no-toner"),
+    ],
+)
+def test_supply_and_hardware_faults_stop_the_printer(win, bits, reason):
+    win.win32print.status = bits
+
+    printer = win.module.get_printer_list()["data"]["printers"][0]
+    assert printer["status"] == "stopped"
+    assert reason in printer["status_reasons"]
+    assert printer["is_accepting"] is False
+
+
+def test_paper_out_print_is_refused_with_503(win):
+    win.win32print.status = FakeWin32Print.PRINTER_STATUS_PAPER_OUT
+    win.calls.clear()
+
+    result = win.module.print_file(None, _pdf(win.tmp_path), None)
+
+    assert result["code"] == 503, result
+    assert "out-of-paper" in result["data"]["status_reasons"]
+    assert result["data"]["status"] == "stopped"
+    _assert_nothing_touched_the_device(win.calls)
+
+
+def test_door_open_print_is_refused_with_503(win):
+    win.win32print.status = FakeWin32Print.PRINTER_STATUS_DOOR_OPEN
+    result = win.module.print_file(None, _pdf(win.tmp_path), None)
+    assert result["code"] == 503, result
+    assert "door-open" in result["data"]["status_reasons"]
+
+
+@pytest.mark.parametrize(
+    "bits, reason",
+    [
+        (PRINTER_STATUS_PRINTING, "printing"),
+        (PRINTER_STATUS_IO_ACTIVE, "io-active"),
+        (FakeWin32Print.PRINTER_STATUS_BUSY, "busy"),
+    ],
+)
+def test_activity_bits_mean_processing_not_unknown(win, bits, reason):
+    win.win32print.status = bits
+
+    printer = win.module.get_printer_list()["data"]["printers"][0]
+    assert printer["status"] == "processing"
+    assert reason in printer["status_reasons"]
+    assert printer["is_accepting"] is True
+
+
+def test_processing_printer_still_accepts_jobs(win):
+    win.win32print.status = PRINTER_STATUS_PRINTING
+    result = win.module.print_file(None, _pdf(win.tmp_path), None)
+    assert result["code"] == 200, result
+
+
+def test_paper_jam_while_printing_is_stopped(win):
+    """A fault outranks activity: the job would only queue behind the jam."""
+    win.win32print.status = (
+        PRINTER_STATUS_PRINTING | FakeWin32Print.PRINTER_STATUS_PAPER_JAM
+    )
+    printer = win.module.get_printer_list()["data"]["printers"][0]
+    assert printer["status"] == "stopped"
+    assert "paper-jam" in printer["status_reasons"]
+    assert "printing" in printer["status_reasons"]
+    assert printer["is_accepting"] is False
+
+
+def test_toner_low_is_only_advisory(win):
+    win.win32print.status = FakeWin32Print.PRINTER_STATUS_TONER_LOW
+    printer = win.module.get_printer_list()["data"]["printers"][0]
+    assert printer["status"] == "idle"
+    assert printer["status_reasons"] == ["toner-low"]
+    assert printer["is_accepting"] is True
+    assert win.module.print_file(None, _pdf(win.tmp_path), None)["code"] == 200
+
+
+def test_unrecognised_status_bit_is_unknown_but_accepting(win):
+    win.win32print.status = 0x80000000
+    printer = win.module.get_printer_list()["data"]["printers"][0]
+    assert printer["status"] == "unknown"
+    assert printer["status_reasons"] == []
+    assert printer["is_accepting"] is True
+
+
+# ------------------------------------------- total-pixel render bound (R2 fix F)
+
+
+def test_bound_dpi_by_pixels_leaves_letter_page_alone():
+    assert win_render.bound_dpi_by_pixels(300, 8.5, 11) == 300
+
+
+def test_bound_dpi_by_pixels_reduces_dpi_for_a_poster():
+    # 36x48 in at 300 dpi = 155.5 MP; the 50 MP budget forces ~170 dpi.
+    dpi = win_render.bound_dpi_by_pixels(300, 36, 48)
+    assert dpi < 300
+    assert (36 * dpi) * (48 * dpi) <= 50_000_000
+    assert (36 * (dpi + 1)) * (48 * (dpi + 1)) > 50_000_000  # largest that fits
+    assert dpi >= win_render.MIN_RENDER_DPI
+
+
+def test_bound_dpi_by_pixels_honours_a_custom_budget():
+    assert win_render.bound_dpi_by_pixels(300, 8.5, 11, max_megapixels=1.0) < 300
+
+
+def test_bound_dpi_by_pixels_never_goes_below_the_minimum():
+    assert win_render.bound_dpi_by_pixels(300, 1000, 1000) == win_render.MIN_RENDER_DPI
+
+
+@pytest.mark.parametrize("w, h", [(0, 11), (8.5, 0), (-1, 11), (None, 11), ("x", 11)])
+def test_bound_dpi_by_pixels_ignores_unknown_page_size(w, h):
+    assert win_render.bound_dpi_by_pixels(300, w, h) == 300
+
+
+def test_device_units_to_inches():
+    assert win_render.device_units_to_inches(5100, 600) == 8.5
+    assert win_render.device_units_to_inches(0, 600) == 0.0
+    assert win_render.device_units_to_inches(5100, 0) == 0.0
+    assert win_render.device_units_to_inches(None, 600) == 0.0
+
+
+def test_gdi_path_lowers_dpi_for_a_huge_physical_page(win, monkeypatch):
+    # 36x48 inches at the fake's 600 device dpi
+    caps = dict(FakeDC.CAPS)
+    caps[110] = 36 * 600
+    caps[111] = 48 * 600
+    monkeypatch.setattr(FakeDC, "CAPS", caps)
+
+    result = win.module.print_file(None, _pdf(win.tmp_path), None)
+
+    assert result["code"] == 200, result
+    assert result["data"]["dpi"] < 300
+    assert (36 * result["data"]["dpi"]) * (48 * result["data"]["dpi"]) <= 50_000_000
 
 
 def test_online_printer_still_prints_with_attribute_bit_clear(win):

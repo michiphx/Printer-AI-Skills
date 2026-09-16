@@ -49,6 +49,61 @@ def resolve_render_dpi(device_dpi: int, max_dpi: int = DEFAULT_MAX_RENDER_DPI) -
     return max(MIN_RENDER_DPI, min(max_dpi, dpi))
 
 
+# A per-inch cap is not enough on its own: a 36x48 inch poster at 300 dpi is
+# still 155 megapixels (~620 MB of RGBA). Bound the whole bitmap too.
+DEFAULT_MAX_RENDER_MEGAPIXELS = 50.0
+
+
+def device_units_to_inches(units: int, device_dpi: int) -> float:
+    """Convert a GetDeviceCaps length (device pixels) to inches; 0 if unknown."""
+    try:
+        units = float(units)
+        device_dpi = float(device_dpi)
+    except (TypeError, ValueError):
+        return 0.0
+    if units <= 0 or device_dpi <= 0:
+        return 0.0
+    return units / device_dpi
+
+
+def bound_dpi_by_pixels(
+    dpi: int,
+    width_inches: float,
+    height_inches: float,
+    max_megapixels: float = DEFAULT_MAX_RENDER_MEGAPIXELS,
+) -> int:
+    """Lower ``dpi`` until a ``width x height`` inch page fits ``max_megapixels``.
+
+    Pure arithmetic so it can be unit-tested anywhere. Unknown or non-positive
+    page dimensions leave ``dpi`` untouched; the result never drops below
+    MIN_RENDER_DPI.
+    """
+    try:
+        dpi = int(dpi)
+        width_inches = float(width_inches)
+        height_inches = float(height_inches)
+        max_megapixels = float(max_megapixels)
+    except (TypeError, ValueError):
+        return dpi
+    if dpi <= 0 or width_inches <= 0 or height_inches <= 0 or max_megapixels <= 0:
+        return dpi
+
+    budget = max_megapixels * 1_000_000
+    pixels = (width_inches * dpi) * (height_inches * dpi)
+    if pixels <= budget:
+        return dpi
+
+    # pixels scale with dpi^2, so the largest fitting dpi is sqrt(budget/area)
+    area = width_inches * height_inches
+    fitted = int((budget / area) ** 0.5)
+    fitted = max(MIN_RENDER_DPI, min(dpi, fitted))
+    logger.warning(
+        f"[bound_dpi_by_pixels] {width_inches:.1f}x{height_inches:.1f} in page at "
+        f"{dpi} dpi would be {pixels / 1e6:.0f} MP; rendering at {fitted} dpi instead"
+    )
+    return fitted
+
+
 def fit_rect(
     src_w: int,
     src_h: int,

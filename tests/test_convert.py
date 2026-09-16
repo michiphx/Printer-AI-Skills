@@ -54,9 +54,19 @@ try:
 except ImportError:  # pragma: no cover
     HAS_REPORTLAB = False
 
+try:
+    import markdown  # noqa: F401
+
+    HAS_MARKDOWN = True
+except ImportError:  # pragma: no cover
+    HAS_MARKDOWN = False
+
 needs_pillow = pytest.mark.skipif(not HAS_PILLOW, reason="Pillow is not installed")
 needs_reportlab = pytest.mark.skipif(
     not HAS_REPORTLAB, reason="reportlab is not installed"
+)
+needs_markdown = pytest.mark.skipif(
+    not HAS_MARKDOWN, reason="the markdown package is not installed"
 )
 
 
@@ -364,6 +374,7 @@ class TestImageConversion:
 
 
 class TestMarkdown:
+    @needs_markdown
     def test_to_html_renders_fenced_code_and_tables(self, tmp_path):
         source = write(
             tmp_path / "doc.md",
@@ -378,6 +389,8 @@ class TestMarkdown:
         assert "doc.md" in html  # the <title>
         assert "font-family" in html  # embedded CSS
 
+    @needs_markdown
+    @needs_reportlab
     def test_falls_back_to_text_without_any_html_renderer(
         self, tmp_path, no_external_tools
     ):
@@ -388,6 +401,7 @@ class TestMarkdown:
         assert is_pdf(result.pdf_path)
         assert any("plain text" in note for note in result.notes)
 
+    @needs_markdown
     @needs_soffice
     def test_markdown_without_browser_uses_libreoffice(self, tmp_path, no_browser):
         source = write(tmp_path / "doc.md", "# Title\n\nbody text\n")
@@ -700,10 +714,21 @@ class FakeCOMApp:
         self.log.append(("quit", self.kind, None))
 
 
+#: PID the fake Office processes run under.
+FAKE_OFFICE_PID = 4242
+
+
 @pytest.fixture
 def fake_com(monkeypatch):
-    """Install fake pywin32 COM modules so the Windows path can be tested here."""
+    """Install fake pywin32 modules so the Windows COM path can be tested here.
+
+    Besides ``pythoncom``/``win32com.client`` this fakes the ``win32gui``,
+    ``win32process`` and ``win32api`` pieces the timeout handling uses to
+    find and kill a hung Office process: every ``DispatchEx`` "creates" a
+    top-level window of the application's class owned by FAKE_OFFICE_PID.
+    """
     log = []
+    windows = {}  # hwnd -> (class name, pid); populated by dispatch
 
     pythoncom = types.ModuleType("pythoncom")
     pythoncom.CoInitialize = lambda: log.append(("coinit", None, None))
@@ -713,15 +738,48 @@ def fake_com(monkeypatch):
 
     def dispatch(prog_id):
         log.append(("dispatch", prog_id, None))
+        hwnd = 1000 + len(windows)
+        windows[hwnd] = (
+            convert.OfficeConverter.OFFICE_WINDOW_CLASSES[prog_id], FAKE_OFFICE_PID
+        )
         return FakeCOMApp(log, prog_id)
 
     client.DispatchEx = dispatch
     win32com = types.ModuleType("win32com")
     win32com.client = client
 
+    win32gui = types.ModuleType("win32gui")
+
+    def enum_windows(callback, extra):
+        for hwnd in list(windows):
+            callback(hwnd, extra)
+
+    win32gui.EnumWindows = enum_windows
+    win32gui.GetClassName = lambda hwnd: windows[hwnd][0]
+
+    win32process = types.ModuleType("win32process")
+    win32process.GetWindowThreadProcessId = lambda hwnd: (1, windows[hwnd][1])
+
+    def terminate(handle, exit_code):
+        log.append(("terminate", handle, exit_code))
+
+    win32process.TerminateProcess = terminate
+
+    win32api = types.ModuleType("win32api")
+
+    def open_process(access, inherit, pid):
+        log.append(("open_process", pid, access))
+        return ("handle", pid)
+
+    win32api.OpenProcess = open_process
+    win32api.CloseHandle = lambda handle: log.append(("close_handle", handle, None))
+
     monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
     monkeypatch.setitem(sys.modules, "win32com", win32com)
     monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setitem(sys.modules, "win32gui", win32gui)
+    monkeypatch.setitem(sys.modules, "win32process", win32process)
+    monkeypatch.setitem(sys.modules, "win32api", win32api)
     return log
 
 
@@ -821,7 +879,9 @@ class TestOfficeCOM:
         assert opened[3]["ReadOnly"] is True
         assert opened[3]["UpdateLinks"] == 0
 
-    def test_hung_office_times_out_and_is_quit(self, tmp_path, fake_com, monkeypatch):
+    def test_hung_office_times_out_and_is_terminated_by_pid(
+        self, tmp_path, fake_com, monkeypatch
+    ):
         import threading
 
         never = threading.Event()
@@ -837,11 +897,73 @@ class TestOfficeCOM:
             convert.OfficeConverter().convert_with_com(
                 source, str(tmp_path / "o.pdf"), timeout=0.2
             )
-        never.set()  # let the abandoned worker thread finish
-
+        # Everything below happens BEFORE the worker is released: the kill
+        # must not depend on the hung thread ever coming back.
         assert exc_info.value.code == 504
         assert "timed out" in str(exc_info.value)
-        assert ("quit", "Word.Application", None) in fake_com
+        opened = [e for e in fake_com if e[0] == "open_process"]
+        assert opened and opened[0][1] == FAKE_OFFICE_PID
+        assert ("terminate", ("handle", FAKE_OFFICE_PID), 1) in fake_com
+        assert ("close_handle", ("handle", FAKE_OFFICE_PID), None) in fake_com
+        # Quit() is apartment-bound; it must never be called cross-thread.
+        assert ("quit", "Word.Application", None) not in fake_com
+        never.set()  # let the abandoned worker thread finish
+
+    def test_hung_excel_pid_comes_from_hwnd(self, tmp_path, fake_com, monkeypatch):
+        """Excel/PowerPoint expose Hwnd, which beats window enumeration."""
+        import threading
+
+        never = threading.Event()
+
+        def block_forever(self, path, **kwargs):
+            never.wait()
+
+        monkeypatch.setattr(FakeCOMCollection, "Open", block_forever)
+        # Excel's Hwnd; the fake win32process maps any known hwnd to a pid.
+        # Register it as an existing window so GetWindowThreadProcessId knows it.
+        monkeypatch.setattr(FakeCOMApp, "Hwnd", 1000, raising=False)
+        source = write(tmp_path / "sheet.xlsx", "x")
+
+        with pytest.raises(convert.ConversionError):
+            convert.OfficeConverter().convert_with_com(
+                source, str(tmp_path / "o.pdf"), timeout=0.2
+            )
+        assert ("terminate", ("handle", FAKE_OFFICE_PID), 1) in fake_com
+        never.set()
+
+    def test_timeout_without_a_known_pid_still_raises_504(
+        self, tmp_path, fake_com, monkeypatch
+    ):
+        import threading
+
+        never = threading.Event()
+
+        def block_forever(self, path, **kwargs):
+            never.wait()
+
+        monkeypatch.setattr(FakeCOMCollection, "Open", block_forever)
+        # Enumeration finds nothing: the pid is unknown.
+        monkeypatch.setattr(
+            convert.OfficeConverter, "_office_window_pids", classmethod(lambda cls, p: set())
+        )
+        source = write(tmp_path / "letter.docx", "x")
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.OfficeConverter().convert_with_com(
+                source, str(tmp_path / "o.pdf"), timeout=0.2
+            )
+        assert exc_info.value.code == 504
+        assert not [e for e in fake_com if e[0] in ("open_process", "terminate")]
+        never.set()
+
+    def test_terminate_pid_reports_failure_when_open_process_fails(
+        self, fake_com, monkeypatch
+    ):
+        def refuse(access, inherit, pid):
+            raise OSError("access denied")
+
+        monkeypatch.setattr(sys.modules["win32api"], "OpenProcess", refuse)
+        assert convert.OfficeConverter._terminate_pid(FAKE_OFFICE_PID) is False
+        assert not [e for e in fake_com if e[0] == "terminate"]
 
     def test_timeout_comes_from_the_environment(self, tmp_path, fake_com, monkeypatch):
         import threading
@@ -898,6 +1020,88 @@ class TestOfficeCOM:
         assert used == [source]
         assert is_pdf(produced)
         assert any("unusable" in note for note in notes)
+
+    @staticmethod
+    def _fake_libreoffice(monkeypatch, used):
+        monkeypatch.setattr(convert, "find_soffice", lambda: "/fake/soffice")
+
+        def fake_lo(self, source, out_dir, notes):
+            used.append(source)
+            target = os.path.join(out_dir, "letter.pdf")
+            with open(target, "wb") as handle:
+                handle.write(b"%PDF-1.4\n")
+            notes.append("converted by LibreOffice (fake)")
+            return target
+
+        monkeypatch.setattr(convert.OfficeConverter, "convert_with_libreoffice", fake_lo)
+
+    def test_com_timeout_falls_back_to_libreoffice(self, tmp_path, monkeypatch, fake_com):
+        """A hung Office (504) is a tool problem: LibreOffice gets a turn."""
+        monkeypatch.setattr(convert, "_msoffice_com_available", lambda: True)
+
+        def hang(self, source, target, timeout=None):
+            raise convert.ConversionError("Office COM conversion timed out after 1s", code=504)
+
+        monkeypatch.setattr(convert.OfficeConverter, "convert_with_com", hang)
+        used = []
+        self._fake_libreoffice(monkeypatch, used)
+
+        source = write(tmp_path / "letter.docx", "x")
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        notes = []
+        produced = convert.OfficeConverter().convert(source, str(out_dir), notes)
+
+        assert used == [source]
+        assert is_pdf(produced)
+        assert any("Office COM failed/timed out" in note for note in notes)
+        assert any("LibreOffice" in note for note in notes)
+
+    def test_com_crash_500_falls_back_to_libreoffice(self, tmp_path, monkeypatch, fake_com):
+        monkeypatch.setattr(convert, "_msoffice_com_available", lambda: True)
+
+        def crash(self, source, target, timeout=None):
+            raise convert.ConversionError("Office crashed", code=500)
+
+        monkeypatch.setattr(convert.OfficeConverter, "convert_with_com", crash)
+        used = []
+        self._fake_libreoffice(monkeypatch, used)
+        source = write(tmp_path / "letter.docx", "x")
+        notes = []
+        produced = convert.OfficeConverter().convert(source, str(tmp_path), notes)
+        assert used == [source] and is_pdf(produced)
+
+    def test_com_timeout_without_libreoffice_is_final(self, tmp_path, monkeypatch, fake_com):
+        monkeypatch.setattr(convert, "_msoffice_com_available", lambda: True)
+        monkeypatch.setattr(convert, "find_soffice", lambda: None)
+
+        def hang(self, source, target, timeout=None):
+            raise convert.ConversionError("Office COM conversion timed out", code=504)
+
+        monkeypatch.setattr(convert.OfficeConverter, "convert_with_com", hang)
+        source = write(tmp_path / "letter.docx", "x")
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.OfficeConverter().convert(source, str(tmp_path), [])
+        assert exc_info.value.code == 504
+
+    @pytest.mark.parametrize("code", [415, 422])
+    def test_com_document_errors_do_not_fall_back(
+        self, tmp_path, monkeypatch, fake_com, code
+    ):
+        """A bad document is bad in LibreOffice too; do not retry it."""
+        monkeypatch.setattr(convert, "_msoffice_com_available", lambda: True)
+
+        def reject(self, source, target, timeout=None):
+            raise convert.ConversionError("document problem", code=code)
+
+        monkeypatch.setattr(convert.OfficeConverter, "convert_with_com", reject)
+        used = []
+        self._fake_libreoffice(monkeypatch, used)
+        source = write(tmp_path / "letter.docx", "x")
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.OfficeConverter().convert(source, str(tmp_path), [])
+        assert exc_info.value.code == code
+        assert used == []
 
 
 # ==================== soffice discovery ====================
@@ -973,6 +1177,96 @@ class TestPassthrough:
         result = convert.to_pdf(str(path))
         convert.cleanup(result)
         assert path.exists()
+
+
+class TestNativeExtensionIsVerified:
+    """A .pdf/.ps name alone must not send a file to the printer untouched."""
+
+    def test_html_error_page_named_pdf_is_not_native(self, tmp_path):
+        path = tmp_path / "download.pdf"
+        path.write_bytes(b"<html><body><h1>404 Not Found</h1></body></html>\n")
+        kind, how = convert.detect_format(str(path))
+        assert kind == convert.KIND_HTML
+        assert how == "magic-override"
+
+    def test_html_named_pdf_does_not_pass_through(self, tmp_path, no_external_tools):
+        path = tmp_path / "download.pdf"
+        path.write_bytes(b"<!DOCTYPE html><html><body>nope</body></html>\n")
+        # With no renderer available this must fail loudly - never native.
+        try:
+            result = convert.to_pdf(str(path), out_dir=str(tmp_path / "out"))
+        except convert.ConversionError as exc:
+            assert exc.detected == convert.KIND_HTML
+        else:
+            assert result.native is False
+            assert result.converted is True
+
+    def test_plain_text_named_ps_is_treated_as_text(self, tmp_path):
+        path = tmp_path / "notes.ps"
+        path.write_bytes(b"just some notes, not PostScript\n")
+        kind, how = convert.detect_format(str(path))
+        assert kind == convert.KIND_TEXT
+        assert how == "magic-override"
+
+    def test_binary_junk_named_pdf_is_unsupported(self, tmp_path):
+        path = tmp_path / "junk.pdf"
+        path.write_bytes(b"\x00\x01\xff\xfe" * 32)
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.to_pdf(str(path))
+        assert exc_info.value.detected == convert.KIND_UNSUPPORTED
+
+    def test_real_pdf_and_ps_still_trusted(self, tmp_path):
+        pdf = tmp_path / "ok.pdf"
+        pdf.write_bytes(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+        ps = tmp_path / "ok.ps"
+        ps.write_bytes(b"%!PS-Adobe-3.0\n")
+        pjl = tmp_path / "wrapped.ps"
+        pjl.write_bytes(b"\x04%!PS-Adobe-3.0\n")
+        for path in (pdf, ps, pjl):
+            assert convert.detect_format(str(path)) == (convert.KIND_NATIVE, "extension")
+
+    def test_pcl_capture_named_prn_still_trusted(self, tmp_path):
+        prn = tmp_path / "capture.prn"
+        prn.write_bytes(b"\x1b%-12345X@PJL ENTER LANGUAGE=PCL\n\x1bE")
+        assert convert.detect_format(str(prn)) == (convert.KIND_NATIVE, "extension")
+
+
+class TestEncryptedPdf:
+    @staticmethod
+    def _pdf(encrypted):
+        body = b"%PDF-1.6\n1 0 obj<</Type/Catalog>>endobj\n"
+        trailer = b"trailer\n<</Root 1 0 R"
+        if encrypted:
+            trailer += b" /Encrypt 5 0 R"
+        trailer += b">>\nstartxref\n0\n%%EOF\n"
+        return body + trailer
+
+    def test_encrypted_pdf_is_422(self, tmp_path):
+        path = tmp_path / "secret.pdf"
+        path.write_bytes(self._pdf(encrypted=True))
+        assert convert.pdf_is_encrypted(str(path)) is True
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.to_pdf(str(path))
+        assert exc_info.value.code == 422
+        assert "encrypted" in str(exc_info.value)
+        assert exc_info.value.hint
+
+    def test_plain_pdf_passes_through(self, tmp_path):
+        path = tmp_path / "open.pdf"
+        path.write_bytes(self._pdf(encrypted=False))
+        assert convert.pdf_is_encrypted(str(path)) is False
+        result = convert.to_pdf(str(path))
+        assert result.native is True and result.converted is False
+
+    def test_encrypt_only_counts_near_the_trailer(self, tmp_path):
+        """/Encrypt buried early (e.g. in page text) far from the trailer is ignored."""
+        path = tmp_path / "mention.pdf"
+        path.write_bytes(
+            b"%PDF-1.4\n(the word /Encrypt appears in a string)\n"
+            + b"%" * 4096
+            + b"\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+        )
+        assert convert.pdf_is_encrypted(str(path)) is False
 
 
 class TestErrors:
@@ -1116,6 +1410,7 @@ class TestErrorCodes:
         assert exc_info.value.code == 422
         assert "password" in exc_info.value.hint
 
+    @needs_reportlab
     def test_converter_crash_is_500(self, tmp_path, monkeypatch):
         source = write(tmp_path / "notes.txt", "hello\n")
 
@@ -1128,6 +1423,7 @@ class TestErrorCodes:
         assert exc_info.value.code == 500
         assert "kaboom" in str(exc_info.value)
 
+    @needs_reportlab
     def test_code_survives_the_to_pdf_wrapper(self, tmp_path, monkeypatch):
         """to_pdf re-raises a converter's ConversionError with its code intact."""
         source = write(tmp_path / "notes.txt", "hello\n")

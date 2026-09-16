@@ -246,7 +246,8 @@ def cmd_print(args):
     """Print a file, converting it to PDF first unless --raw was given.
 
     Every failure is reported as JSON on stdout (exit 1), so a caller can
-    always parse the outcome; only success has a human-readable form. The
+    always parse the outcome; success is human-readable unless ``--json``
+    asks for the full result dict. The
     checks that need no printer backend (file exists, --options is an object)
     run first, so their answers do not depend on the machine's print system.
     """
@@ -312,6 +313,11 @@ def cmd_print(args):
 
     if result.get("code") != 200:
         # Dump the whole result: it carries the reason and any hint
+        finish(result, True)
+
+    if getattr(args, "json", False):
+        # The whole result: job_id, converter/converted/converted_from/
+        # conversion_notes, and the Windows method/pages/dpi/copies fields.
         finish(result, True)
 
     data = result.get("data", {})
@@ -779,6 +785,9 @@ def build_parser():
                               "(only for data the printer understands itself)")
     p_print.add_argument("--keep-pdf", action="store_true",
                          help="keep the converted PDF and report its path")
+    p_print.add_argument("--json", action="store_true",
+                         help="output the full result as JSON on success too "
+                              "(failures are always JSON)")
     p_print.set_defaults(func=cmd_print)
 
     # convert

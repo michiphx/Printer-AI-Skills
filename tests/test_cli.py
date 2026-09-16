@@ -246,6 +246,10 @@ def test_remove_without_yes_is_refused(cli):
     assert "without --yes" in (out + err)
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="name validation lives in setup_windows; other platforms answer 501 before it",
+)
 def test_remove_comma_in_name_is_rejected(cli):
     code, out, err = cli("remove", "a,b", "--yes")
     assert code == 1

@@ -200,9 +200,39 @@ def setup(
             host, name=name, allow_generic=allow_generic, dry_run=dry_run,
             vendor_lookup=vendor_lookup,
         )
-        code = 200 if not result.get("error") else 500
-        return APIResponse(code=code, msg=result.get("error", "success"), data=result).to_dict()
+        error = result.get("error")
+        code = _setup_error_code(error) if error else 200
+        return APIResponse(code=code, msg=error or "success", data=result).to_dict()
     return _setup_cups(host, name=name, dry_run=dry_run)
+
+
+# Error strings from setup_windows.setup_printer / plan_setup that describe the
+# caller's input or the device rather than a failure on this machine.
+_SETUP_BAD_INPUT_MARKERS = ("invalid ",)
+_SETUP_NOT_FOUND_MARKERS = (
+    "no printing port",
+    "not reachable",
+    "unreachable",
+    "not found",
+    "does not answer",
+)
+
+
+def _setup_error_code(error: Any) -> int:
+    """Map a setup error message to an HTTP-style code.
+
+    Bad input (malformed host, unusable queue name) is 400; a host with no
+    printing port / that cannot be reached is 404; anything else - a strategy,
+    driver or port installation failing - is a genuine 500.
+    """
+    text = str(error or "").strip().lower()
+    if not text:
+        return 500
+    if any(text.startswith(marker) for marker in _SETUP_BAD_INPUT_MARKERS):
+        return 400
+    if any(marker in text for marker in _SETUP_NOT_FOUND_MARKERS):
+        return 404
+    return 500
 
 
 def _setup_cups(host: str, name: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
