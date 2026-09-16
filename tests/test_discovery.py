@@ -312,10 +312,102 @@ class TestHostOf:
             ("WSD-4b8f6c11-....", None),
             (None, None),
             ("", None),
+            # network URIs with a literal host
+            ("ipp://192.168.1.72:631/ipp/print", "192.168.1.72"),
+            ("socket://10.0.0.5:9100", "10.0.0.5"),
+            ("ipp://[fe80::1]:631/ipp/print", "fe80::1"),
+            # hostnames are not resolved by host_of
+            ("ipp://EPSON7D8B68.local:631/ipp/print", None),
+            ("socket://myprinter:9100", None),
+            ("dnssd://EPSON%20ET-4850._ipp._tcp.local/?uuid=abc", None),
+            # non-network URIs never yield a host
+            ("usb://EPSON/ET-4850?serial=X", None),
+            ("file:///dev/null", None),
+            ("cups-pdf:/", None),
         ],
     )
     def test_host_of(self, text, expected):
         assert discovery.host_of(text) == expected
+
+
+# ----------------------------------------------------------- resolve_host
+
+
+def _fake_getaddrinfo(address, family=None):
+    def _gai(host, port, *args, **kwargs):
+        fam = family if family is not None else discovery.socket.AF_INET
+        return [(fam, discovery.socket.SOCK_STREAM, 6, "", (address, 0))]
+    return _gai
+
+
+def _failing_getaddrinfo(host, port, *args, **kwargs):
+    raise discovery.socket.gaierror(-2, "Name or service not known")
+
+
+class TestResolveHost:
+    def test_no_host_text_returns_none(self, monkeypatch):
+        monkeypatch.setattr(discovery.socket, "getaddrinfo", _failing_getaddrinfo)
+        for text in (None, "", "nul:", "file:///dev/null", "cups-pdf:/",
+                     "usb://EPSON/ET-4850?serial=X", "WSD-4b8f6c11", "Room 3"):
+            assert discovery.resolve_host(text) is None, text
+
+    def test_literal_ipv4_does_not_touch_dns(self, monkeypatch):
+        monkeypatch.setattr(discovery.socket, "getaddrinfo", _failing_getaddrinfo)
+        result = discovery.resolve_host("ipp://192.168.1.72:631/ipp/print")
+        assert result == {"hostname": "192.168.1.72", "address": "192.168.1.72", "reason": None}
+        assert discovery.resolve_host("IP_10.0.0.5")["address"] == "10.0.0.5"
+
+    def test_literal_ipv6(self, monkeypatch):
+        monkeypatch.setattr(discovery.socket, "getaddrinfo", _failing_getaddrinfo)
+        result = discovery.resolve_host("ipp://[fe80::1]:631/ipp/print")
+        assert result["address"] == "fe80::1"
+        assert result["reason"] is None
+
+    def test_hostname_resolves_via_getaddrinfo(self, monkeypatch):
+        seen = []
+
+        def gai(host, port, *args, **kwargs):
+            seen.append(host)
+            return [
+                (discovery.socket.AF_INET6, 1, 6, "", ("fe80::1", 0, 0, 0)),
+                (discovery.socket.AF_INET, 1, 6, "", ("192.168.1.72", 0)),
+            ]
+
+        monkeypatch.setattr(discovery.socket, "getaddrinfo", gai)
+        result = discovery.resolve_host("ipp://EPSON7D8B68.local:631/ipp/print")
+        assert seen == ["epson7d8b68.local"]
+        # IPv4 answer is preferred even when it is not first
+        assert result == {"hostname": "epson7d8b68.local", "address": "192.168.1.72", "reason": None}
+
+    def test_hostname_falls_back_to_first_answer(self, monkeypatch):
+        monkeypatch.setattr(
+            discovery.socket, "getaddrinfo",
+            _fake_getaddrinfo("fe80::2", family=discovery.socket.AF_INET6),
+        )
+        assert discovery.resolve_host("socket://myprinter:9100")["address"] == "fe80::2"
+
+    def test_hostname_gaierror_is_unresolved(self, monkeypatch):
+        monkeypatch.setattr(discovery.socket, "getaddrinfo", _failing_getaddrinfo)
+        result = discovery.resolve_host("socket://myprinter:9100")
+        assert result["address"] is None
+        assert result["hostname"] == "myprinter"
+        assert "does not resolve" in result["reason"]
+
+    def test_hostname_oserror_is_unresolved(self, monkeypatch):
+        def gai(host, port, *args, **kwargs):
+            raise OSError("network down")
+
+        monkeypatch.setattr(discovery.socket, "getaddrinfo", gai)
+        assert discovery.resolve_host("ipp://printer.example:631/")["address"] is None
+
+    def test_dnssd_is_unresolved_without_dns_lookup(self, monkeypatch):
+        def gai(host, port, *args, **kwargs):
+            raise AssertionError("dnssd:// must not hit getaddrinfo")
+
+        monkeypatch.setattr(discovery.socket, "getaddrinfo", gai)
+        result = discovery.resolve_host("dnssd://EPSON%20ET-4850._ipp._tcp.local/?uuid=abc")
+        assert result["address"] is None
+        assert "DNS-SD" in result["reason"]
 
 
 # --------------------------------------------------------------- scan_subnet

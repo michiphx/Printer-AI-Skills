@@ -197,18 +197,59 @@ def cmd_attrs(args):
 
 
 def _conversion_failure(exc, file_path):
-    """Turn a ConversionError into the CLI's 415 result."""
+    """Turn a ConversionError into a CLI result.
+
+    The code comes from the exception (415 unsupported/tool missing, 422 broken
+    input, 504 tool timeout, 500 tool crash); 415 when an older ConversionError
+    carries none.
+    """
     data = exc.to_data()
     data.setdefault("file_path", file_path)
-    return {"code": 415, "msg": str(exc), "data": data}
+    code = getattr(exc, "code", None)
+    if not isinstance(code, int):
+        code = 415
+    return {"code": code, "msg": str(exc), "data": data}
+
+
+def _load_options_dict(raw):
+    """Parse the --options string into a dict, or return a 400 result.
+
+    Returns (dict, None) on success and (None, result) on failure. Anything
+    that is valid JSON but not an object is rejected here, before
+    ``PrintOptions.from_dict`` could trip over it with an AttributeError.
+    """
+    try:
+        options_dict = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return None, {"code": 400, "msg": f"invalid --options JSON: {e}", "data": {}}
+    if not isinstance(options_dict, dict):
+        return None, {
+            "code": 400,
+            "msg": (
+                "invalid --options: expected a JSON object such as "
+                '{"copies": 2}, got ' + type(options_dict).__name__
+            ),
+            "data": {"options": options_dict},
+        }
+    return options_dict, None
+
+
+def _build_print_options(options_dict, options_class):
+    """Turn a parsed --options dict into a PrintOptions, or a 400 result."""
+    try:
+        return options_class.from_dict(options_dict), None
+    except (TypeError, ValueError, AttributeError, KeyError) as e:
+        return None, {"code": 400, "msg": f"invalid print options: {e}", "data": {}}
 
 
 def cmd_print(args):
-    """Print a file, converting it to PDF first unless --raw was given."""
-    backend, error = _backend()
-    if error:
-        finish(error, False)
+    """Print a file, converting it to PDF first unless --raw was given.
 
+    Every failure is reported as JSON on stdout (exit 1), so a caller can
+    always parse the outcome; only success has a human-readable form. The
+    checks that need no printer backend (file exists, --options is an object)
+    run first, so their answers do not depend on the machine's print system.
+    """
     if not os.path.exists(args.file_path):
         finish(
             {
@@ -216,19 +257,24 @@ def cmd_print(args):
                 "msg": f"file not found: {args.file_path}",
                 "data": {"file_path": args.file_path},
             },
-            False,
+            True,
         )
 
-    # Parse print options
+    options_dict = None
+    if args.options:
+        options_dict, error = _load_options_dict(args.options)
+        if error:
+            finish(error, True)
+
+    backend, error = _backend()
+    if error:
+        finish(error, True)
+
     print_options = None
-    if args.options and backend.PrintOptions:
-        try:
-            options_dict = json.loads(args.options)
-            print_options = backend.PrintOptions.from_dict(options_dict)
-        except json.JSONDecodeError as e:
-            finish({"code": 400, "msg": f"invalid --options JSON: {e}", "data": {}}, False)
-        except TypeError as e:
-            finish({"code": 400, "msg": f"invalid print options: {e}", "data": {}}, False)
+    if options_dict is not None and backend.PrintOptions:
+        print_options, error = _build_print_options(options_dict, backend.PrintOptions)
+        if error:
+            finish(error, True)
 
     # Normalise the file to PDF so the backend only ever sees something it can
     # actually render. --raw skips this and hands the bytes over untouched.
@@ -326,23 +372,64 @@ def cmd_convert(args):
         finish({"code": 400, "msg": f"cannot use --out directory: {e}", "data": {}},
                args.json)
 
+    source_abs = os.path.abspath(args.file_path)
+    stem = os.path.splitext(os.path.basename(source_abs))[0] or "document"
+    # Where the PDF will end up. A file that is already printable (PDF/PS) is
+    # copied under its own name so a .ps does not get a misleading .pdf suffix.
     try:
-        conversion = convert_module.to_pdf(args.file_path, out_dir=out_dir)
+        kind, _how = convert_module.detect_format(source_abs)
+    except OSError as e:
+        finish({"code": 400, "msg": f"cannot read {args.file_path}: {e}", "data": {}},
+               True)
+    native = kind == convert_module.KIND_NATIVE
+    if final_path:
+        target_path = final_path
+    elif native:
+        target_path = os.path.join(out_dir, os.path.basename(source_abs))
+    else:
+        target_path = os.path.join(out_dir, stem + ".pdf")
+
+    # A native source with no --out (or --out pointing at its own directory)
+    # needs nothing written at all; anything else must not clobber a file the
+    # user did not ask to replace.
+    writes_target = not (native and os.path.abspath(target_path) == source_abs)
+    if writes_target and os.path.exists(target_path) and not args.overwrite:
+        finish(
+            {
+                "code": 409,
+                "msg": f"refusing to overwrite existing file: {target_path}",
+                "data": {"path": target_path, "hint": "pass --overwrite to replace it"},
+            },
+            True,
+        )
+
+    try:
+        if final_path:
+            # Convert into a temporary directory, then move to the requested
+            # name: converting straight into out_dir could clobber an
+            # unrelated <stem>.pdf that happens to live there.
+            conversion = convert_module.to_pdf(source_abs)
+        else:
+            conversion = convert_module.to_pdf(source_abs, out_dir=out_dir)
     except convert_module.ConversionError as exc:
         finish(_conversion_failure(exc, args.file_path), True)
 
+    import shutil
+
     pdf_path = conversion.pdf_path
     notes = list(conversion.notes)
-    if final_path and os.path.abspath(final_path) != os.path.abspath(pdf_path):
+    try:
         if conversion.native:
-            # Never move the user's own file around; copy it to the target.
-            import shutil
-
-            shutil.copyfile(pdf_path, final_path)
-            notes.append("copied: the source was already printable")
-        else:
-            os.replace(pdf_path, final_path)
-        pdf_path = final_path
+            if writes_target:
+                # Never move the user's own file around; copy it to the target.
+                shutil.copy2(pdf_path, target_path)
+                notes.append("copied: the source was already printable")
+                pdf_path = target_path
+        elif os.path.abspath(pdf_path) != os.path.abspath(target_path):
+            shutil.move(pdf_path, target_path)
+            pdf_path = target_path
+    finally:
+        convert_module.cleanup(conversion)
 
     result = {
         "code": 200,
@@ -448,35 +535,9 @@ def cmd_cancel_job(args):
 
 # ==================== network discovery / install commands ====================
 #
-# The network commands live in local_printer.commands_net, which owns its own
-# handlers (cmd_discover, cmd_setup, ...) and the same "exit 0 only on code 200"
-# rule. main.py just parses the arguments and hands them over; the local
-# implementations below are used only when that module has no handler for a
-# command, so the CLI keeps working either way.
-
-
-def _run_net_command(name, args, fallback):
-    """Dispatch a network subcommand to commands_net, else to the fallback."""
-    from local_printer import commands_net
-
-    handler = getattr(commands_net, f"cmd_{name}", None)
-    if handler is None:
-        return fallback(args)
-    result = handler(args)
-    # These handlers normally exit by themselves; honour a returned result too.
-    if isinstance(result, dict):
-        finish(result, getattr(args, "json", False))
-    sys.exit(0)
-
-
-def _net(name, fallback):
-    """Build the argparse callback for a network subcommand."""
-
-    def runner(args):
-        return _run_net_command(name, args, fallback)
-
-    runner.__name__ = f"cmd_{name}"
-    return runner
+# The network operations live in local_printer.commands_net (discover, probe,
+# diagnose, setup, ...), which return plain result dicts. The cmd_* functions
+# below parse the arguments, call them, and render the outcome.
 
 
 def cmd_discover(args):
@@ -727,6 +788,9 @@ def build_parser():
     p_conv.add_argument("--out", default=None, metavar="PATH_OR_DIR",
                         help="output PDF path or directory "
                              "(default: next to the source file)")
+    p_conv.add_argument("--overwrite", action="store_true",
+                        help="replace an existing output file "
+                             "(otherwise an existing file is a 409 error)")
     p_conv.add_argument("--json", action="store_true", help="output JSON")
     p_conv.set_defaults(func=cmd_convert)
 
@@ -763,13 +827,13 @@ def build_parser():
                         help="allow scanning a subnet that is not one of this machine's "
                              "own /24 networks")
     p_disc.add_argument("--json", action="store_true", help="output JSON")
-    p_disc.set_defaults(func=_net("discover", cmd_discover))
+    p_disc.set_defaults(func=cmd_discover)
 
     # probe
     p_probe = subparsers.add_parser("probe", help="check whether one host is a printer")
     p_probe.add_argument("host", help="IP address")
     p_probe.add_argument("--timeout", type=float, default=1.0, help="timeout in seconds")
-    p_probe.set_defaults(func=_net("probe", cmd_probe))
+    p_probe.set_defaults(func=cmd_probe)
 
     # diagnose
     p_diag = subparsers.add_parser(
@@ -777,16 +841,16 @@ def build_parser():
     p_diag.add_argument("--timeout", type=float, default=1.0, help="timeout in seconds")
     p_diag.add_argument("--fast", action="store_true", help="skip the IPP identity query")
     p_diag.add_argument("--json", action="store_true", help="output JSON")
-    p_diag.set_defaults(func=_net("diagnose", cmd_diagnose))
+    p_diag.set_defaults(func=cmd_diagnose)
 
     # ports
     p_ports = subparsers.add_parser("ports", help="list printer ports")
-    p_ports.set_defaults(func=_net("ports", cmd_ports))
+    p_ports.set_defaults(func=cmd_ports)
 
     # drivers
     p_drv = subparsers.add_parser("drivers", help="list installed printer drivers")
     p_drv.add_argument("--model", default=None, help="match candidate drivers for a model")
-    p_drv.set_defaults(func=_net("drivers", cmd_drivers))
+    p_drv.set_defaults(func=cmd_drivers)
 
     # setup
     p_setup = subparsers.add_parser(
@@ -802,7 +866,7 @@ def build_parser():
                          help="query the manufacturer's download portal for a driver "
                               "(sends model/OS/region to the vendor)")
     p_setup.add_argument("--json", action="store_true", help="output JSON")
-    p_setup.set_defaults(func=_net("setup", cmd_setup))
+    p_setup.set_defaults(func=cmd_setup)
 
     # driver-search
     p_ds = subparsers.add_parser(
@@ -822,18 +886,18 @@ def build_parser():
                       help="open the download link in the default browser "
                            "(for vendors that refuse scripted downloads)")
     p_ds.add_argument("--json", action="store_true", help="output JSON")
-    p_ds.set_defaults(func=_net("driver_search", cmd_driver_search))
+    p_ds.set_defaults(func=cmd_driver_search)
 
     # remove
     p_rm = subparsers.add_parser("remove", help="delete a printer queue")
     p_rm.add_argument("name", help="printer name")
     p_rm.add_argument("--yes", action="store_true", help="confirm the deletion")
-    p_rm.set_defaults(func=_net("remove", cmd_remove))
+    p_rm.set_defaults(func=cmd_remove)
 
     # set-default
     p_sd = subparsers.add_parser("set-default", help="set the default printer")
     p_sd.add_argument("name", help="printer name")
-    p_sd.set_defaults(func=_net("set_default", cmd_set_default))
+    p_sd.set_defaults(func=cmd_set_default)
 
     return parser
 
@@ -863,7 +927,10 @@ def main():
         print("Aborted", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
+        # A human gets the one-liner on stderr; a program always finds a
+        # parseable result on stdout, whatever went wrong.
         print(f"Error: {e}", file=sys.stderr)
+        output_json({"code": 500, "msg": str(e), "data": {}})
         sys.exit(1)
 
 

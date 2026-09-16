@@ -38,16 +38,21 @@ def print_file_prompt():
     - Automatic format conversion between generic and CUPS-specific options
     
     Print Options Format:
-    CUPS uses IPP standard parameters:
-    - copies: Number of copies (string, e.g., "2")
+    CUPS uses IPP standard parameters. Option names are hyphenated and every
+    value is passed to pycups as a string (pycups raises TypeError on anything
+    else). LinuxPrintOptions.to_dict() does the translation, so a caller may
+    still use the snake_case field names and ints; the dict that reaches
+    printFile() looks like {"copies": "2", "media": "A4", "print-color-mode": "color"}.
+    - copies: Number of copies (e.g., "2")
     - media: Paper size (e.g., "A4", "Letter", "Legal")
-    - orientation_requested: "3"=Portrait, "4"=Landscape
-    - print_color_mode: "monochrome" or "color"
+    - orientation-requested: "3"=Portrait, "4"=Landscape
+    - print-color-mode: "monochrome" or "color"
     - sides: "one-sided", "two-sided-long-edge", "two-sided-short-edge"
-    - print_quality: "3"=Draft, "4"=Normal, "5"=High
-    - page_ranges: Specific pages (e.g., "1-5,10-15")
-    - number_up: Pages per sheet (e.g., "2")
-    
+    - print-quality: "3"=Draft, "4"=Normal, "5"=High
+    - page-ranges: Specific pages (e.g., "1-5,10-15")
+    - number-up: Pages per sheet (e.g., "2")
+    - fit-to-page: "true" or "false"
+
     Usage Tips:
     - Always check printer status before printing
     - Use printer attributes to determine available options
@@ -67,7 +72,7 @@ def get_print_options_format():
     response = {
         "platform": "Linux/macOS",
         "format": "CUPS/IPP (Internet Printing Protocol)",
-        "description": "Linux/macOS uses CUPS with IPP standard options",
+        "description": "Linux/macOS uses CUPS with IPP standard options. Names are hyphenated (print-color-mode); snake_case aliases (print_color_mode) are accepted too. All values are sent to CUPS as strings.",
         "documentation": {
             "cups_options": "https://www.cups.org/doc/options.html",
             "ipp_attributes": "https://www.iana.org/assignments/ipp-registrations/ipp-registrations.xhtml",
@@ -82,12 +87,12 @@ def get_print_options_format():
                 "description": "Paper size name, see: https://www.cups.org/doc/spec-ppd.html",
                 "common_values": ["A3", "A4", "A5", "Letter", "Legal", "Executive"],
             },
-            "orientation_requested": {
+            "orientation-requested": {
                 "type": "str",
                 "description": "Paper orientation (IPP enum)",
                 "values": {"3": "Portrait", "4": "Landscape", "5": "Reverse Landscape", "6": "Reverse Portrait"},
             },
-            "print_color_mode": {
+            "print-color-mode": {
                 "type": "str",
                 "description": "Color printing mode",
                 "values": ["monochrome", "color"],
@@ -97,30 +102,30 @@ def get_print_options_format():
                 "description": "Duplex (double-sided) printing mode",
                 "values": ["one-sided", "two-sided-long-edge", "two-sided-short-edge"],
             },
-            "print_quality": {
+            "print-quality": {
                 "type": "str",
                 "description": "Print quality (IPP enum)",
                 "values": {"3": "Draft", "4": "Normal", "5": "High"},
             },
-            "page_ranges": {
+            "page-ranges": {
                 "type": "str",
                 "description": "Page ranges to print, e.g. '1-5,10-15'",
             },
-            "number_up": {
+            "number-up": {
                 "type": "str",
                 "description": "Number of pages per sheet",
                 "values": ["1", "2", "4", "6", "9", "16"],
             },
-            "fit_to_page": {
+            "fit-to-page": {
                 "type": "str",
                 "description": "Scale pages to fit the selected media size",
                 "values": ["true", "false"],
             },
-            "media_source": {
+            "media-source": {
                 "type": "str",
                 "description": "Paper source/tray, device-specific values",
             },
-            "media_type": {
+            "media-type": {
                 "type": "str",
                 "description": "Media type, device-specific values",
             },
@@ -133,18 +138,18 @@ def get_print_options_format():
             "basic_print": {
                 "copies": "1",
                 "media": "A4",
-                "orientation_requested": "3",
-                "print_color_mode": "monochrome",
+                "orientation-requested": "3",
+                "print-color-mode": "monochrome",
             },
             "advanced_print": {
                 "copies": "2",
                 "media": "A4",
-                "orientation_requested": "4",
-                "print_color_mode": "color",
+                "orientation-requested": "4",
+                "print-color-mode": "color",
                 "sides": "two-sided-long-edge",
-                "print_quality": "4",
-                "page_ranges": "1-5,10-15",
-                "number_up": "2",
+                "print-quality": "4",
+                "page-ranges": "1-5,10-15",
+                "number-up": "2",
             },
         },
     }

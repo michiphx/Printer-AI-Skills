@@ -233,6 +233,20 @@ def get_printer_list() -> Dict[str, Any]:
                 if printer_info["Status"] & win32print.PRINTER_STATUS_NO_TONER:
                     status_reasons.append("no-toner")
 
+                # "Use Printer Offline" (the queue-level toggle in the Windows
+                # printer menu) is NOT reflected in Status: the spooler records
+                # it in Attributes as PRINTER_ATTRIBUTE_WORK_OFFLINE, which is
+                # 0x00000400 in WINSPOOL.H. pywin32 does not always export the
+                # constant, so fall back to the header value.
+                work_offline = getattr(
+                    win32print, "PRINTER_ATTRIBUTE_WORK_OFFLINE", 0x00000400
+                )
+                if printer_info.get("Attributes", 0) & work_offline:
+                    status = PrinterStatus.STOPPED
+                    is_accepting = False
+                    if "offline" not in status_reasons:
+                        status_reasons.append("offline")
+
                 printer_obj = Printer(
                     index=index,
                     name=printer_name,
@@ -1038,6 +1052,23 @@ def print_file(index: Optional[int] = None, file_path: str = "",
     if printer is None:
         return error
     printer_name = printer.name
+
+    # Pre-flight, mirroring the CUPS backend: a stopped queue (paused, in
+    # error, offline or "Use Printer Offline") would only swallow the job into
+    # the spooler, so refuse before any device context or spooler call.
+    if printer.status == PrinterStatus.STOPPED or not printer.is_accepting:
+        reasons = list(printer.status_reasons or [])
+        detail = ", ".join(reasons) if reasons else "not accepting jobs"
+        return APIResponse.error(
+            503,
+            f"Printer is stopped, cannot print ({detail})",
+            {
+                "printer_name": printer_name,
+                "status": printer.status.value,
+                "status_reasons": reasons,
+                "is_accepting": printer.is_accepting,
+            },
+        ).to_dict()
 
     if raw:
         # The caller explicitly asked for the bytes to go out untouched.

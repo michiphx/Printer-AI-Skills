@@ -22,6 +22,7 @@ announces over mDNS.  Do not copy this ``ssl`` setup into any code path that sen
 credentials or fetches data from the internet.
 """
 
+import ipaddress
 import re
 import socket
 import ssl
@@ -30,6 +31,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from utils.logger import logger
 
@@ -565,12 +567,127 @@ def is_private_prefix(prefix: str) -> bool:
     return False
 
 
+# URI schemes whose authority part names a device on the network.  Anything
+# else (usb://, file://, cups-pdf:, hp://, serial:, beh:, nul:, ...) has no
+# host worth resolving, even if urlsplit would happily report one for it.
+NETWORK_URI_SCHEMES = frozenset({
+    "ipp", "ipps", "http", "https", "socket", "lpd", "lpr", "smb", "dnssd",
+})
+
+_IPV4_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
+
+
+def _ip_literal(value: Optional[str]) -> Optional[str]:
+    """Return `value` if it is a literal IPv4/IPv6 address, else None."""
+    if not value:
+        return None
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return value
+
+
+def _uri_hostname(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """(scheme, hostname) of a network printer URI, or (None, None).
+
+    Only URIs with a network scheme count -- a Windows port name such as
+    ``IP_192.168.1.72`` or a ``usb://`` URI is not one.
+    """
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return None, None
+    scheme = (parts.scheme or "").lower()
+    if scheme not in NETWORK_URI_SCHEMES:
+        return None, None
+    try:
+        hostname = parts.hostname
+    except ValueError:  # malformed IPv6 bracket / port
+        hostname = None
+    return scheme, (hostname or None)
+
+
 def host_of(text: Optional[str]) -> Optional[str]:
-    """Pull an IPv4 address out of a port name, URI or location string."""
+    """Pull a literal IP address out of a port name, URI or location string.
+
+    A network URI (``ipp://[fe80::1]:631/...``, ``socket://10.0.0.5:9100``)
+    yields its host when that host is an IP literal, v4 or v6.  Anything else
+    falls back to the first dotted-quad found in the text, which is how
+    Windows port names (``IP_192.168.1.72``) and free-text locations work.
+    Hostnames are *not* resolved here -- see `resolve_host` for that.
+    """
     if not text:
         return None
-    match = re.search(r"\d{1,3}(?:\.\d{1,3}){3}", text)
+    _scheme, hostname = _uri_hostname(text)
+    literal = _ip_literal(hostname)
+    if literal:
+        return literal
+    match = _IPV4_RE.search(text)
     return match.group(0) if match else None
+
+
+def _resolve_hostname(hostname: str) -> Optional[str]:
+    """DNS/mDNS-resolve `hostname` to an address; None when it does not resolve.
+
+    Prefers an IPv4 answer when there is one, since that is what the rest of
+    the probing stack is exercised against, else takes the first answer.
+    """
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except (socket.gaierror, OSError) as exc:
+        logger.debug(f"getaddrinfo({hostname!r}) failed: {exc}")
+        return None
+    first: Optional[str] = None
+    for family, _type, _proto, _canon, sockaddr in infos:
+        address = sockaddr[0] if sockaddr else None
+        if not address:
+            continue
+        if family == socket.AF_INET:
+            return address
+        first = first or address
+    return first
+
+
+def resolve_host(text: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Work out which address, if any, a port name / URI / location points at.
+
+    Returns None when the text names no network host at all (``file://``,
+    ``cups-pdf:``, ``usb://``, ``nul:``, a WSD port, plain free text).
+    Otherwise a dict::
+
+        {"hostname": <as written>, "address": <ip or None>, "reason": <str or None>}
+
+    ``address`` is the literal IP from the text, or the result of resolving a
+    hostname via getaddrinfo.  When it is None the host could not be resolved
+    and ``reason`` says why -- a ``dnssd://`` URI carries only a Bonjour service
+    name, and a plain hostname may simply not resolve on this machine.
+    """
+    if not text:
+        return None
+    scheme, hostname = _uri_hostname(text)
+    if scheme == "dnssd":
+        return {
+            "hostname": hostname,
+            "address": None,
+            "reason": (
+                "DNS-SD (Bonjour) service name could not be resolved to an address "
+                "- this tool has no mDNS browser; the printer's IP is needed to probe it"
+            ),
+        }
+    literal = host_of(text)
+    if literal:
+        return {"hostname": hostname or literal, "address": literal, "reason": None}
+    if not hostname:
+        return None
+    address = _resolve_hostname(hostname)
+    if address:
+        return {"hostname": hostname, "address": address, "reason": None}
+    return {
+        "hostname": hostname,
+        "address": None,
+        "reason": f"hostname {hostname!r} in the printer URI does not resolve",
+    }
 
 
 # --------------------------------------------------------------- the scan

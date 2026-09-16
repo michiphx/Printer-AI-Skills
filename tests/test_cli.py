@@ -135,22 +135,97 @@ def test_status_unknown_index_is_404(cli):
 
 
 @has_windows_backend
-def test_print_empty_docx_is_415(cli, tmp_path):
+def test_print_empty_docx_is_422(cli, tmp_path):
     docx = tmp_path / "empty.docx"
     docx.write_bytes(b"")
     code, out, err = cli("print", str(docx))
     assert code == 1
     result = parse_json_stdout(out)
-    assert result["code"] == 415
+    assert result["code"] == 422
 
 
-@has_windows_backend
-def test_print_missing_pdf_is_404(cli, tmp_path):
+# ---- print failure paths need no printer backend and always answer in JSON
+
+
+def test_print_missing_file_is_json_404(cli, tmp_path):
     missing = tmp_path / "missing.pdf"
     code, out, err = cli("print", str(missing))
     assert code == 1
-    combined = out + err
-    assert "404" in combined
+    result = parse_json_stdout(out)
+    assert result["code"] == 404
+    assert result["data"]["file_path"] == str(missing)
+    assert "Traceback" not in err
+
+
+@pytest.mark.parametrize("raw", ["[1]", '"x"', "42"])
+def test_print_options_must_be_a_json_object(cli, tmp_path, raw):
+    source = tmp_path / "notes.txt"
+    source.write_text("hello\n")
+    code, out, err = cli("print", str(source), "--options", raw)
+    assert code == 1
+    result = parse_json_stdout(out)
+    assert result["code"] == 400
+    assert "JSON object" in result["msg"]
+    assert "Traceback" not in err
+
+
+def test_print_options_invalid_json_is_400(cli, tmp_path):
+    source = tmp_path / "notes.txt"
+    source.write_text("hello\n")
+    code, out, err = cli("print", str(source), "--options", "{oops")
+    assert code == 1
+    assert parse_json_stdout(out)["code"] == 400
+
+
+def test_print_empty_file_is_json_422_or_501(cli, tmp_path):
+    """An empty file is the file's fault (422); without a backend it is 501.
+
+    Either way the answer is JSON, never a traceback.
+    """
+    empty = tmp_path / "empty.docx"
+    empty.write_bytes(b"")
+    code, out, err = cli("print", str(empty))
+    assert code == 1
+    assert parse_json_stdout(out)["code"] in (422, 501)
+    assert "Traceback" not in err
+
+
+# ---- convert: overwrite protection and native copies
+
+
+def test_convert_refuses_to_overwrite_without_flag(cli, tmp_path):
+    source = tmp_path / "notes.txt"
+    source.write_text("hello\n")
+    out_dir = tmp_path / "pdfs"
+    out_dir.mkdir()
+    existing = out_dir / "notes.pdf"
+    existing.write_bytes(b"precious")
+
+    code, out, err = cli("convert", str(source), "--out", str(out_dir), "--json")
+    assert code == 1
+    result = parse_json_stdout(out)
+    assert result["code"] == 409
+    assert result["data"]["path"] == str(existing)
+    assert existing.read_bytes() == b"precious"
+
+    code, out, err = cli("convert", str(source), "--out", str(out_dir), "--overwrite", "--json")
+    assert code == 0
+    assert parse_json_stdout(out)["data"]["pdf_path"] == str(existing)
+    assert existing.read_bytes().startswith(b"%PDF-")
+
+
+def test_convert_native_pdf_into_directory_creates_a_copy(cli, tmp_path):
+    source = tmp_path / "some.pdf"
+    source.write_bytes(b"%PDF-1.4\n%native\n")
+    out_dir = tmp_path / "somedir"
+
+    code, out, err = cli("convert", str(source), "--out", str(out_dir) + "/", "--json")
+    assert code == 0
+    data = parse_json_stdout(out)["data"]
+    copied = out_dir / "some.pdf"
+    assert data["pdf_path"] == str(copied)
+    assert copied.read_bytes() == source.read_bytes()
+    assert source.exists()
 
 
 def test_discover_refuses_non_local_non_private_subnet(cli):

@@ -250,8 +250,13 @@ The point of the tool is that a request in plain language becomes one command.
 ```bash
 # macOS / Linux (CUPS/IPP option names)
 printer-ai print ~/Downloads/invoice.docx \
-  --options '{"print_color_mode":"monochrome","sides":"two-sided-long-edge"}'
+  --options '{"print-color-mode":"monochrome","sides":"two-sided-long-edge"}'
 ```
+
+CUPS option names are the hyphenated IPP ones (snake_case aliases such as
+`print_color_mode` are accepted too) and every value reaches CUPS as a string,
+so `{"copies": 2, "media": "A4", "print-color-mode": "color"}` is sent as
+`{"copies": "2", "media": "A4", "print-color-mode": "color"}`.
 
 ```powershell
 # Windows (DEVMODE option names)

@@ -44,6 +44,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import zipfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -82,17 +83,30 @@ class ConversionError(Exception):
 
     ``hint`` always names the tool that is missing and how to install it, so
     the CLI can pass something actionable back to a human or an AI caller.
-    main.py maps this to an APIResponse with code 415.
+
+    ``code`` is the HTTP-style status main.py reports for the failure, so a
+    caller can tell *whose* fault it is without parsing the message:
+
+    * 415 - the format is unsupported here, or the tool that would convert it
+      is not installed (``available()`` said no). Installing something fixes it.
+    * 422 - the input file itself is broken: empty, corrupt, or password
+      protected. No install will help; the file has to change.
+    * 504 - an external converter (LibreOffice, browser, Office COM) timed out.
+    * 500 - an external converter crashed or exited non-zero unexpectedly.
+    * 404 - the file does not exist (main.py normally catches this earlier).
+
+    415 is the default when nothing more specific is known.
     """
 
     def __init__(self, msg: str, hint: str = "", source_path: str = "",
-                 detected: str = "", converter: str = ""):
+                 detected: str = "", converter: str = "", code: int = 415):
         super().__init__(msg)
         self.msg = msg
         self.hint = hint
         self.source_path = source_path
         self.detected = detected
         self.converter = converter
+        self.code = code
 
     def to_data(self) -> Dict[str, Any]:
         return {
@@ -487,6 +501,23 @@ def _msoffice_com_available() -> bool:
     return True
 
 
+COM_TIMEOUT = 60.0
+
+
+def _com_timeout() -> float:
+    """Seconds an Office COM conversion may take: PRINTER_AI_COM_TIMEOUT or 60."""
+    raw = os.environ.get("PRINTER_AI_COM_TIMEOUT", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+        logger.warning("ignoring invalid PRINTER_AI_COM_TIMEOUT=%r", raw)
+    return COM_TIMEOUT
+
+
 def _run_tool(cmd: List[str], timeout: float, what: str) -> None:
     """Run an external converter, raising ConversionError on any failure.
 
@@ -505,15 +536,20 @@ def _run_tool(cmd: List[str], timeout: float, what: str) -> None:
         raise ConversionError(
             f"{what} timed out after {timeout:.0f}s",
             hint=f"The document may be too large or {what} is waiting for input.",
+            code=504,
         )
+    except FileNotFoundError as exc:
+        # The executable vanished between discovery and use: a missing tool.
+        raise ConversionError(f"{what} could not be started: {exc}", code=415)
     except OSError as exc:
-        raise ConversionError(f"{what} could not be started: {exc}")
+        raise ConversionError(f"{what} could not be started: {exc}", code=500)
     output = (proc.stdout or b"").decode("utf-8", "replace").strip()
     if output:
         logger.info("%s output: %s", what, output[:2000])
     if proc.returncode != 0:
         raise ConversionError(
-            f"{what} failed with exit code {proc.returncode}: {output[:500]}"
+            f"{what} failed with exit code {proc.returncode}: {output[:500]}",
+            code=500,
         )
 
 
@@ -629,9 +665,12 @@ class ImageConverter(BaseConverter):
         try:
             image = Image.open(source)
         except Exception as exc:
+            # Pillow raises UnidentifiedImageError (or a plain OSError for a
+            # truncated header): either way the bytes are not a readable image.
             raise ConversionError(
                 f"the image could not be read: {exc}",
                 hint="The file may be corrupt or in a format Pillow cannot decode.",
+                code=422,
             )
 
         pdf = rl_canvas.Canvas(target, pagesize=(width, height))
@@ -658,7 +697,7 @@ class ImageConverter(BaseConverter):
                 pdf.showPage()
                 frames += 1
         if frames == 0:  # pragma: no cover - defensive
-            raise ConversionError("the image contained no frames")
+            raise ConversionError("the image contained no frames", code=422)
         pdf.save()
         notes.append(
             f"{frames} image frame(s) placed on {page_size_name()} pages"
@@ -834,7 +873,9 @@ class BrowserConverter(BaseConverter):
             ]
             _run_tool(cmd, self.TIMEOUT, f"browser ({os.path.basename(browser)})")
             if not os.path.isfile(target):
-                raise ConversionError("the browser produced no PDF", hint=BROWSER_HINT)
+                raise ConversionError(
+                    "the browser produced no PDF", hint=BROWSER_HINT, code=500
+                )
         except ConversionError as exc:
             # A browser that is installed but cannot run headless here (a
             # sandbox, a locked profile, a kiosk policy) must not make the
@@ -1004,12 +1045,16 @@ class OfficeConverter(BaseConverter):
                 if name.lower().endswith(".pdf")
             ]
             if not produced:
+                # LibreOffice exits 0 but writes nothing for a document it
+                # cannot open: corrupt, or password protected (it never
+                # prompts in headless mode). That is a property of the file.
                 raise ConversionError(
                     "LibreOffice produced no PDF for this document",
                     hint=(
                         "The file may be corrupt or password protected. "
                         + LIBREOFFICE_HINT
                     ),
+                    code=422,
                 )
             target = self._target(source, out_dir)
             shutil.move(produced[0], target)
@@ -1020,70 +1065,149 @@ class OfficeConverter(BaseConverter):
             shutil.rmtree(scratch, ignore_errors=True)
 
     # -- Microsoft Office (COM) ---------------------------------------
-    def convert_with_com(self, source: str, target: str) -> None:
+    #: msoAutomationSecurityForceDisable - macros in the opened document
+    #: never run, whatever the user's Trust Center says.
+    AUTOMATION_SECURITY_FORCE_DISABLE = 3
+
+    def _com_export(self, ext: str, source: str, target: str,
+                    state: Dict[str, Any]) -> None:
+        """The COM conversion proper; runs inside the worker thread.
+
+        ``state["app"]`` is set as soon as the application exists so the
+        caller can ``Quit()`` it if this thread never returns. Macros are
+        disabled before any document is opened, and every open uses flags
+        that never prompt, repair, convert or touch the recent-files list.
+        """
+        import win32com.client
+
+        if ext in self.WORD_EXTENSIONS:
+            app = win32com.client.DispatchEx("Word.Application")
+            state["app"] = app
+            try:
+                app.AutomationSecurity = self.AUTOMATION_SECURITY_FORCE_DISABLE
+                app.Visible = False
+                app.DisplayAlerts = False
+                document = app.Documents.Open(
+                    source,
+                    ReadOnly=True,
+                    AddToRecentFiles=False,
+                    ConfirmConversions=False,
+                    OpenAndRepair=False,
+                )
+                try:
+                    # 17 == wdExportFormatPDF
+                    document.ExportAsFixedFormat(target, 17)
+                finally:
+                    document.Close(False)
+            finally:
+                app.Quit()
+        elif ext in self.EXCEL_EXTENSIONS:
+            app = win32com.client.DispatchEx("Excel.Application")
+            state["app"] = app
+            try:
+                app.AutomationSecurity = self.AUTOMATION_SECURITY_FORCE_DISABLE
+                app.Visible = False
+                app.DisplayAlerts = False
+                # UpdateLinks=0: never follow external links in the workbook.
+                workbook = app.Workbooks.Open(source, ReadOnly=True, UpdateLinks=0)
+                try:
+                    # 0 == xlTypePDF
+                    workbook.ExportAsFixedFormat(0, target)
+                finally:
+                    workbook.Close(False)
+            finally:
+                app.Quit()
+        elif ext in self.POWERPOINT_EXTENSIONS:
+            app = win32com.client.DispatchEx("PowerPoint.Application")
+            state["app"] = app
+            try:
+                app.AutomationSecurity = self.AUTOMATION_SECURITY_FORCE_DISABLE
+                presentation = app.Presentations.Open(
+                    source, ReadOnly=True, WithWindow=False
+                )
+                try:
+                    # 32 == ppSaveAsPDF
+                    presentation.SaveAs(target, 32)
+                finally:
+                    presentation.Close()
+            finally:
+                app.Quit()
+
+    def convert_with_com(self, source: str, target: str,
+                         timeout: Optional[float] = None) -> None:
         """Drive Microsoft Office through COM to export a PDF.
 
         Windows only, and only when pywin32 is installed. Every application is
         quit in a ``finally`` block: an orphaned invisible WINWORD.EXE would
         block the next conversion forever.
+
+        The conversion runs in a worker thread with its own COM apartment and
+        is given ``timeout`` seconds (default :func:`_com_timeout`, i.e.
+        ``PRINTER_AI_COM_TIMEOUT`` or 60). Office can hang on a modal dialog
+        that ``DisplayAlerts = False`` does not cover; without a timeout the
+        CLI would hang with it.
         """
-        import pythoncom
-        import win32com.client
+        import pythoncom  # noqa: F401 - fail early, like the worker would
+        import win32com.client  # noqa: F401
 
         source = os.path.abspath(source)
         target = os.path.abspath(target)
         ext = os.path.splitext(source)[1].lower()
+        if timeout is None:
+            timeout = _com_timeout()
 
-        pythoncom.CoInitialize()
-        try:
-            if ext in self.WORD_EXTENSIONS:
-                app = win32com.client.DispatchEx("Word.Application")
-                try:
-                    app.Visible = False
-                    app.DisplayAlerts = False
-                    document = app.Documents.Open(source, ReadOnly=True)
-                    try:
-                        # 17 == wdExportFormatPDF
-                        document.ExportAsFixedFormat(target, 17)
-                    finally:
-                        document.Close(False)
-                finally:
-                    app.Quit()
-            elif ext in self.EXCEL_EXTENSIONS:
-                app = win32com.client.DispatchEx("Excel.Application")
-                try:
-                    app.Visible = False
-                    app.DisplayAlerts = False
-                    workbook = app.Workbooks.Open(source, ReadOnly=True)
-                    try:
-                        # 0 == xlTypePDF
-                        workbook.ExportAsFixedFormat(0, target)
-                    finally:
-                        workbook.Close(False)
-                finally:
-                    app.Quit()
-            elif ext in self.POWERPOINT_EXTENSIONS:
-                app = win32com.client.DispatchEx("PowerPoint.Application")
-                try:
-                    presentation = app.Presentations.Open(
-                        source, ReadOnly=True, WithWindow=False
-                    )
-                    try:
-                        # 32 == ppSaveAsPDF
-                        presentation.SaveAs(target, 32)
-                    finally:
-                        presentation.Close()
-                finally:
-                    app.Quit()
-            else:
-                raise ConversionError(
-                    f"no Microsoft Office application handles '{ext}'"
-                )
-        finally:
+        if not (
+            ext in self.WORD_EXTENSIONS
+            or ext in self.EXCEL_EXTENSIONS
+            or ext in self.POWERPOINT_EXTENSIONS
+        ):
+            raise ConversionError(
+                f"no Microsoft Office application handles '{ext}'", code=415
+            )
+
+        state: Dict[str, Any] = {"app": None, "error": None}
+
+        def worker() -> None:
+            import pythoncom as _pythoncom
+
+            # COM apartments are per thread, so initialise here, not outside.
+            _pythoncom.CoInitialize()
             try:
-                pythoncom.CoUninitialize()
-            except Exception:  # pragma: no cover - best effort
-                pass
+                self._com_export(ext, source, target, state)
+            except BaseException as exc:  # re-raised in the calling thread
+                state["error"] = exc
+            finally:
+                try:
+                    _pythoncom.CoUninitialize()
+                except Exception:  # pragma: no cover - best effort
+                    pass
+
+        thread = threading.Thread(
+            target=worker, name="printer-ai-office-com", daemon=True
+        )
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            # The worker is stuck inside Office. Quit the application so it
+            # does not linger as an invisible process; the daemon thread is
+            # abandoned (it dies with the interpreter).
+            app = state.get("app")
+            if app is not None:
+                try:
+                    app.Quit()
+                except Exception:  # pragma: no cover - Office may be wedged
+                    logger.warning("could not quit the hung Office application")
+            raise ConversionError(
+                f"Office COM conversion timed out after {timeout:.0f}s",
+                hint=(
+                    "Microsoft Office did not finish exporting the document. It "
+                    "may be waiting on a dialog; set PRINTER_AI_COM_TIMEOUT to "
+                    "allow more time, or install LibreOffice as a fallback."
+                ),
+                code=504,
+            )
+        if state["error"] is not None:
+            raise state["error"]
 
     def convert(self, source: str, out_dir: str, notes: List[str]) -> str:
         target = self._target(source, out_dir)
@@ -1224,6 +1348,7 @@ def to_pdf(path: str, out_dir: Optional[str] = None) -> ConvertResult:
             f"file not found: {path}",
             hint="Check the path; the file must exist and be readable.",
             source_path=path,
+            code=404,
         )
     if os.path.getsize(path) == 0:
         raise ConversionError(
@@ -1231,6 +1356,7 @@ def to_pdf(path: str, out_dir: Optional[str] = None) -> ConvertResult:
             hint="Check that the file was written completely.",
             source_path=path,
             detected="empty",
+            code=422,
         )
 
     kind, how = detect_format(path)
@@ -1300,12 +1426,15 @@ def to_pdf(path: str, out_dir: Optional[str] = None) -> ConvertResult:
     except Exception as exc:
         if temp:
             shutil.rmtree(target_dir, ignore_errors=True)
+        # An unexpected exception inside a converter: a crash, not a format
+        # or install problem.
         raise ConversionError(
             f"conversion failed: {exc}",
             hint=converter.install_hint,
             source_path=path,
             detected=kind,
             converter=converter.name,
+            code=500,
         )
 
     if not os.path.isfile(pdf_path):  # pragma: no cover - defensive
@@ -1317,6 +1446,7 @@ def to_pdf(path: str, out_dir: Optional[str] = None) -> ConvertResult:
             source_path=path,
             detected=kind,
             converter=converter.name,
+            code=500,
         )
 
     return ConvertResult(

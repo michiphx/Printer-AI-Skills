@@ -1,8 +1,8 @@
 """In-process unit tests for main.py's dispatch helpers.
 
 Unlike test_cli.py (which drives the CLI through subprocess), these tests
-import `main` directly to exercise `finish`, `_backend`, `_run_net_command`
-and `build_parser` without paying for a new interpreter per case.
+import `main` directly to exercise `finish`, `_backend` and `build_parser`
+without paying for a new interpreter per case.
 
 The `print` / `convert` / `formats` commands are exercised here too, with the
 platform backend replaced by a fake: the point is what main.py does around the
@@ -77,59 +77,30 @@ class TestBackend:
         assert first == second
 
 
-class TestRunNetCommand:
-    def test_uses_fallback_when_handler_missing(self, monkeypatch):
-        from local_printer import commands_net
+class TestNetCommandsBindDirectly:
+    """The network subcommands call main's own cmd_* functions, no indirection."""
 
-        monkeypatch.delattr(commands_net, "cmd_totally_made_up", raising=False)
+    @pytest.mark.parametrize(
+        "argv, func",
+        [
+            (["discover"], main.cmd_discover),
+            (["probe", "1.2.3.4"], main.cmd_probe),
+            (["diagnose"], main.cmd_diagnose),
+            (["ports"], main.cmd_ports),
+            (["drivers"], main.cmd_drivers),
+            (["setup", "1.2.3.4"], main.cmd_setup),
+            (["driver-search", "x"], main.cmd_driver_search),
+            (["remove", "x"], main.cmd_remove),
+            (["set-default", "x"], main.cmd_set_default),
+        ],
+    )
+    def test_func_is_the_local_handler(self, argv, func):
+        args = main.build_parser().parse_args(argv)
+        assert args.func is func
 
-        calls = []
-
-        def fallback(args):
-            calls.append(args)
-            return "fallback-result"
-
-        args = argparse.Namespace(json=False)
-        result = main._run_net_command("totally_made_up", args, fallback)
-
-        assert result == "fallback-result"
-        assert calls == [args]
-
-    def test_forwards_to_handler_when_present(self, monkeypatch, capsys):
-        from local_printer import commands_net
-
-        def fake_handler(args):
-            return {"code": 200, "msg": "ok", "data": {}}
-
-        monkeypatch.setattr(commands_net, "cmd_fake_thing", fake_handler, raising=False)
-
-        def fallback(args):
-            pytest.fail("fallback should not be called when a handler exists")
-
-        args = argparse.Namespace(json=True)
-        with pytest.raises(SystemExit) as exc_info:
-            main._run_net_command("fake_thing", args, fallback)
-
-        assert exc_info.value.code == 0
-        out = capsys.readouterr().out
-        assert '"code": 200' in out
-
-    def test_handler_non_dict_result_exits_zero(self, monkeypatch):
-        from local_printer import commands_net
-
-        def fake_handler(args):
-            # Handlers that already called sys.exit/finish themselves return None.
-            return None
-
-        monkeypatch.setattr(commands_net, "cmd_already_exited", fake_handler, raising=False)
-
-        def fallback(args):
-            pytest.fail("fallback should not be called when a handler exists")
-
-        args = argparse.Namespace(json=False)
-        with pytest.raises(SystemExit) as exc_info:
-            main._run_net_command("already_exited", args, fallback)
-        assert exc_info.value.code == 0
+    def test_no_dead_dispatch_helpers(self):
+        assert not hasattr(main, "_run_net_command")
+        assert not hasattr(main, "_net")
 
 
 class TestBuildParser:
@@ -180,6 +151,11 @@ class TestBuildParser:
         args = parser.parse_args(["convert", "a.md", "--out", "/tmp/x.pdf", "--json"])
         assert args.out == "/tmp/x.pdf"
         assert args.json is True
+        assert args.overwrite is False
+
+    def test_convert_overwrite_flag(self):
+        args = main.build_parser().parse_args(["convert", "a.md", "--overwrite"])
+        assert args.overwrite is True
 
     def test_formats_json_flag(self):
         parser = main.build_parser()
@@ -320,9 +296,103 @@ class TestCmdPrint:
         assert result["code"] == 415
         assert "libreoffice.org" in result["data"]["hint"].lower()
 
-    def test_missing_file_is_404(self, fake_backend, tmp_path, capsys):
+    def test_missing_file_is_404_as_json(self, fake_backend, tmp_path, capsys):
         run_cli(["print", str(tmp_path / "nope.txt")], expect_code=1)
-        assert "404" in capsys.readouterr().err
+        result = json.loads(capsys.readouterr().out)
+        assert result["code"] == 404
+        assert result["data"]["file_path"].endswith("nope.txt")
+
+    def test_missing_file_is_404_even_without_a_backend(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(main, "_backend", lambda: (None, {"code": 501, "msg": "no"}))
+        run_cli(["print", str(tmp_path / "nope.txt")], expect_code=1)
+        assert json.loads(capsys.readouterr().out)["code"] == 404
+
+    def test_empty_file_is_422(self, fake_backend, tmp_path, capsys):
+        source = tmp_path / "empty.docx"
+        source.write_bytes(b"")
+        run_cli(["print", str(source)], expect_code=1)
+        result = json.loads(capsys.readouterr().out)
+        assert result["code"] == 422
+        assert fake_backend.calls == []
+
+    def test_conversion_failure_uses_the_exception_code(
+        self, fake_backend, tmp_path, capsys, monkeypatch
+    ):
+        from local_printer import convert
+
+        source = tmp_path / "notes.txt"
+        source.write_text("hello\n")
+
+        def slow(path, out_dir=None):
+            raise convert.ConversionError("tool timed out", code=504)
+
+        monkeypatch.setattr(convert, "to_pdf", slow)
+        run_cli(["print", str(source)], expect_code=1)
+        assert json.loads(capsys.readouterr().out)["code"] == 504
+
+    def test_conversion_error_without_code_falls_back_to_415(self):
+        class Legacy(Exception):
+            def to_data(self):
+                return {}
+
+        assert main._conversion_failure(Legacy("old"), "f")["code"] == 415
+
+    @pytest.mark.parametrize("raw", ["[1]", '"x"', "3", "null", "true"])
+    def test_options_must_be_a_json_object(self, fake_backend, tmp_path, capsys, raw):
+        fake_backend.PrintOptions = object  # from_dict would blow up if reached
+        source = tmp_path / "notes.txt"
+        source.write_text("hello\n")
+
+        run_cli(["print", str(source), "--options", raw], expect_code=1)
+
+        result = json.loads(capsys.readouterr().out)
+        assert result["code"] == 400
+        assert "JSON object" in result["msg"]
+        assert fake_backend.calls == []
+
+    def test_options_invalid_json_is_400(self, fake_backend, tmp_path, capsys):
+        source = tmp_path / "notes.txt"
+        source.write_text("hello\n")
+        run_cli(["print", str(source), "--options", "{not json"], expect_code=1)
+        result = json.loads(capsys.readouterr().out)
+        assert result["code"] == 400
+        assert "JSON" in result["msg"]
+
+    def test_backend_failure_is_json(self, fake_backend, tmp_path, capsys, monkeypatch):
+        source = tmp_path / "doc.pdf"
+        source.write_bytes(b"%PDF-1.4\n")
+        monkeypatch.setattr(
+            fake_backend, "print_file",
+            lambda *a, **k: {"code": 503, "msg": "stopped", "data": {}},
+        )
+        run_cli(["print", str(source)], expect_code=1)
+        assert json.loads(capsys.readouterr().out)["code"] == 503
+
+    def test_no_backend_is_501_json(self, tmp_path, capsys, monkeypatch):
+        source = tmp_path / "doc.pdf"
+        source.write_bytes(b"%PDF-1.4\n")
+        monkeypatch.setattr(main, "_backend", lambda: (None, {"code": 501, "msg": "no"}))
+        run_cli(["print", str(source)], expect_code=1)
+        assert json.loads(capsys.readouterr().out)["code"] == 501
+
+
+class TestMainCatchAll:
+    def test_unexpected_exception_emits_json_and_stderr(self, capsys, monkeypatch):
+        def boom(args):
+            raise RuntimeError("wires crossed")
+
+        # build_parser() binds the module-level cmd_formats at call time.
+        monkeypatch.setattr(main, "cmd_formats", boom)
+        monkeypatch.setattr("sys.argv", ["printer-ai", "formats"])
+
+        with pytest.raises(SystemExit) as exc_info:
+            main.main()
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "Error: wires crossed" in captured.err
+        result = json.loads(captured.out)
+        assert result == {"code": 500, "msg": "wires crossed", "data": {}}
 
 
 class TestCmdConvert:
@@ -379,6 +449,105 @@ class TestCmdConvert:
 
         assert source.exists()
         assert target.exists()
+
+    def test_native_pdf_into_a_directory_is_actually_copied(self, tmp_path, capsys):
+        source = tmp_path / "doc.pdf"
+        source.write_bytes(b"%PDF-1.4\n")
+        target_dir = tmp_path / "pdfs"
+
+        run_cli(["convert", str(source), "--out", str(target_dir), "--json"])
+
+        data = json.loads(capsys.readouterr().out)["data"]
+        assert data["pdf_path"] == str(target_dir / "doc.pdf")
+        assert (target_dir / "doc.pdf").read_bytes() == b"%PDF-1.4\n"
+        assert source.exists()
+        assert any("copied" in n for n in data["notes"])
+
+    def test_native_postscript_keeps_its_own_name_in_a_directory(self, tmp_path, capsys):
+        source = tmp_path / "job.ps"
+        source.write_bytes(b"%!PS-Adobe-3.0\n")
+        target_dir = tmp_path / "out"
+
+        run_cli(["convert", str(source), "--out", str(target_dir), "--json"])
+
+        data = json.loads(capsys.readouterr().out)["data"]
+        assert data["pdf_path"] == str(target_dir / "job.ps")
+        assert (target_dir / "job.ps").exists()
+        assert not (target_dir / "job.pdf").exists()
+
+    def test_native_pdf_without_out_is_left_alone(self, tmp_path, capsys):
+        """No --out and a native source: nothing to write, so nothing to refuse."""
+        source = tmp_path / "doc.pdf"
+        source.write_bytes(b"%PDF-1.4\n")
+
+        run_cli(["convert", str(source), "--json"])
+
+        data = json.loads(capsys.readouterr().out)["data"]
+        assert data["pdf_path"] == str(source)
+        assert source.read_bytes() == b"%PDF-1.4\n"
+
+    def test_refuses_to_overwrite_an_existing_pdf(self, tmp_path, capsys):
+        source = tmp_path / "notes.txt"
+        source.write_text("hello\n")
+        existing = tmp_path / "notes.pdf"
+        existing.write_bytes(b"precious")
+
+        run_cli(["convert", str(source), "--json"], expect_code=1)
+
+        result = json.loads(capsys.readouterr().out)
+        assert result["code"] == 409
+        assert result["data"]["path"] == str(existing)
+        assert "refusing to overwrite" in result["msg"]
+        assert existing.read_bytes() == b"precious"
+
+    def test_overwrite_flag_replaces_the_existing_pdf(self, tmp_path, capsys):
+        source = tmp_path / "notes.txt"
+        source.write_text("hello\n")
+        existing = tmp_path / "notes.pdf"
+        existing.write_bytes(b"precious")
+
+        run_cli(["convert", str(source), "--overwrite", "--json"])
+
+        data = json.loads(capsys.readouterr().out)["data"]
+        assert data["pdf_path"] == str(existing)
+        assert existing.read_bytes().startswith(b"%PDF-")
+
+    def test_refuses_to_overwrite_a_named_target(self, tmp_path, capsys):
+        source = tmp_path / "notes.txt"
+        source.write_text("hello\n")
+        target = tmp_path / "custom.pdf"
+        target.write_bytes(b"precious")
+
+        run_cli(["convert", str(source), "--out", str(target), "--json"], expect_code=1)
+
+        assert json.loads(capsys.readouterr().out)["code"] == 409
+        assert target.read_bytes() == b"precious"
+
+    def test_named_target_does_not_clobber_a_sibling_pdf(self, tmp_path, capsys):
+        """Converting to custom.pdf must not touch an unrelated notes.pdf next to it."""
+        source = tmp_path / "notes.txt"
+        source.write_text("hello\n")
+        sibling = tmp_path / "notes.pdf"
+        sibling.write_bytes(b"precious")
+        target = tmp_path / "custom.pdf"
+
+        run_cli(["convert", str(source), "--out", str(target), "--json"])
+
+        assert target.read_bytes().startswith(b"%PDF-")
+        assert sibling.read_bytes() == b"precious"
+
+    def test_native_copy_into_directory_refuses_overwrite(self, tmp_path, capsys):
+        source = tmp_path / "doc.pdf"
+        source.write_bytes(b"%PDF-1.4\n")
+        target_dir = tmp_path / "pdfs"
+        target_dir.mkdir()
+        (target_dir / "doc.pdf").write_bytes(b"precious")
+
+        run_cli(["convert", str(source), "--out", str(target_dir), "--json"], expect_code=1)
+        assert json.loads(capsys.readouterr().out)["code"] == 409
+
+        run_cli(["convert", str(source), "--out", str(target_dir), "--overwrite", "--json"])
+        assert (target_dir / "doc.pdf").read_bytes() == b"%PDF-1.4\n"
 
     def test_missing_file_is_404(self, tmp_path, capsys):
         run_cli(["convert", str(tmp_path / "nope.txt"), "--json"], expect_code=1)

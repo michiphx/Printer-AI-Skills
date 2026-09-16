@@ -212,19 +212,64 @@ class LinuxPrintOptions:
     # Extra options not defined above
     extra_options: Optional[Dict[str, Any]] = None
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary, excluding None values and merging extra_options"""
-        result = {k: v for k, v in asdict(self).items() if v is not None and k != "extra_options"}
+    # Field name -> IPP attribute name. CUPS/IPP option names are hyphenated;
+    # the dataclass fields use underscores because Python identifiers must.
+    # Fields without an underscore (copies, media, sides, scaling, resolution)
+    # are the same in both dialects and need no entry.
+    IPP_NAMES = {
+        "orientation_requested": "orientation-requested",
+        "print_color_mode": "print-color-mode",
+        "print_quality": "print-quality",
+        "page_ranges": "page-ranges",
+        "number_up": "number-up",
+        "fit_to_page": "fit-to-page",
+        "media_source": "media-source",
+        "media_type": "media-type",
+    }
+
+    @staticmethod
+    def _to_ipp_value(value: Any) -> str:
+        """CUPS (pycups) accepts option values as strings only."""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+
+    def to_dict(self) -> Dict[str, str]:
+        """Convert to the dict pycups' printFile() expects.
+
+        Keys are the hyphenated IPP attribute names (``print-color-mode``,
+        not ``print_color_mode``), None values are dropped, every remaining
+        value is coerced to ``str`` (pycups raises TypeError on anything
+        else, e.g. an int ``copies``) and extra_options are merged in.
+        """
+        result: Dict[str, str] = {}
+        for k, v in asdict(self).items():
+            if v is None or k == "extra_options":
+                continue
+            result[self.IPP_NAMES.get(k, k)] = self._to_ipp_value(v)
         if self.extra_options:
-            result.update(self.extra_options)
+            for k, v in self.extra_options.items():
+                if v is not None:
+                    result[k] = self._to_ipp_value(v)
         return result
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LinuxPrintOptions":
-        """Create from dictionary, unknown keys are stored in extra_options"""
+        """Create from dictionary, unknown keys are stored in extra_options.
+
+        Both the snake_case field names (``print_color_mode``) and the
+        hyphenated IPP names (``print-color-mode``) are accepted.
+        """
         known_fields = {f.name for f in fields(cls)} - {"extra_options"}
-        known = {k: v for k, v in data.items() if k in known_fields}
-        extra = {k: v for k, v in data.items() if k not in known_fields}
+        field_names = {v: k for k, v in cls.IPP_NAMES.items()}  # ipp -> field
+        known: Dict[str, Any] = {}
+        extra: Dict[str, Any] = {}
+        for k, v in data.items():
+            field_name = field_names.get(k, k)
+            if field_name in known_fields:
+                known[field_name] = v
+            else:
+                extra[k] = v
         return cls(**known, extra_options=extra if extra else None)
 
 

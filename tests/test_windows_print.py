@@ -102,6 +102,9 @@ class FakeWin32Print:
         self.devmode = devmode
         self.dc_copies = dc_copies
         self.written = []
+        #: PRINTER_INFO_2.Status / .Attributes bitmasks, tunable per test
+        self.status = 0
+        self.attributes = 0
 
     # --- queue discovery
     def EnumPrinters(self, flags):
@@ -116,7 +119,8 @@ class FakeWin32Print:
 
     def GetPrinter(self, handle, level):
         return {
-            "Status": 0,
+            "Status": self.status,
+            "Attributes": self.attributes,
             "pDriverName": "Fake Driver",
             "pPortName": "FAKE:",
             "pLocation": "",
@@ -686,3 +690,115 @@ def test_unreadable_file_is_404(win):
 def test_unknown_printer_index_is_404(win):
     result = win.module.print_file(9999, _pdf(win.tmp_path), None)
     assert result["code"] == 404
+
+
+# ------------------------------------------- offline detection (R1-11)
+
+# WINSPOOL.H value; the fake win32print deliberately does not export the
+# constant so the getattr fallback in windows.py is what gets exercised.
+PRINTER_ATTRIBUTE_WORK_OFFLINE = 0x00000400
+
+
+def test_work_offline_attribute_marks_printer_stopped(win):
+    win.win32print.attributes = PRINTER_ATTRIBUTE_WORK_OFFLINE
+    # Status stays 0: "Use Printer Offline" is only visible in Attributes.
+    win.win32print.status = 0
+
+    result = win.module.get_printer_list()
+    assert result["code"] == 200
+    printer = result["data"]["printers"][0]
+    assert printer["status"] == "stopped"
+    assert "offline" in printer["status_reasons"]
+    assert printer["is_accepting"] is False
+
+    status = win.module.get_printer_status(None)
+    assert status["code"] == 200
+    assert status["data"]["status"] == "stopped"
+    assert status["data"]["is_accepting_jobs"] is False
+    assert "offline" in status["data"]["status_reasons"]
+
+
+def test_work_offline_attribute_does_not_duplicate_offline_reason(win):
+    win.win32print.attributes = PRINTER_ATTRIBUTE_WORK_OFFLINE
+    win.win32print.status = FakeWin32Print.PRINTER_STATUS_OFFLINE
+
+    printer = win.module.get_printer_list()["data"]["printers"][0]
+    assert printer["status"] == "stopped"
+    assert printer["status_reasons"].count("offline") == 1
+
+
+def test_other_attribute_bits_leave_printer_idle(win):
+    # Every attribute bit except WORK_OFFLINE set: still an idle printer.
+    win.win32print.attributes = 0xFFFFFFFF & ~PRINTER_ATTRIBUTE_WORK_OFFLINE
+    win.win32print.status = 0
+
+    printer = win.module.get_printer_list()["data"]["printers"][0]
+    assert printer["status"] == "idle"
+    assert printer["status_reasons"] == []
+    assert printer["is_accepting"] is True
+
+
+def test_missing_attributes_key_is_treated_as_online(win):
+    real = win.win32print.GetPrinter
+
+    def without_attributes(handle, level):
+        info = real(handle, level)
+        info.pop("Attributes")
+        return info
+
+    win.win32print.GetPrinter = without_attributes
+    printer = win.module.get_printer_list()["data"]["printers"][0]
+    assert printer["status"] == "idle"
+    assert printer["is_accepting"] is True
+
+
+def _assert_nothing_touched_the_device(calls):
+    touched = {"CreateDC", "StartDoc", "StartPage", "draw", "EndDoc",
+               "AbortDoc", "DeleteDC", "DocumentProperties",
+               "StartDocPrinter", "WritePrinter"}
+    assert _names(calls, touched) == []
+
+
+def test_print_file_refuses_offline_printer_before_touching_the_dc(win):
+    win.win32print.attributes = PRINTER_ATTRIBUTE_WORK_OFFLINE
+    win.calls.clear()
+
+    result = win.module.print_file(None, _pdf(win.tmp_path), None)
+
+    assert result["code"] == 503, result
+    assert "stopped" in result["msg"].lower()
+    assert "offline" in result["msg"]
+    assert result["data"]["printer_name"] == "Fake Printer"
+    assert result["data"]["status"] == "stopped"
+    assert "offline" in result["data"]["status_reasons"]
+    assert result["data"]["is_accepting"] is False
+    _assert_nothing_touched_the_device(win.calls)
+
+
+def test_print_file_refuses_paused_printer_before_touching_the_dc(win):
+    win.win32print.status = FakeWin32Print.PRINTER_STATUS_PAUSED
+
+    result = win.module.print_file(None, _pdf(win.tmp_path), None)
+
+    assert result["code"] == 503, result
+    assert "paused" in result["data"]["status_reasons"]
+    _assert_nothing_touched_the_device(win.calls)
+
+
+def test_raw_print_is_also_refused_on_offline_printer(win):
+    win.win32print.attributes = PRINTER_ATTRIBUTE_WORK_OFFLINE
+    path = win.tmp_path / "job.prn"
+    path.write_bytes(b"raw bytes")
+
+    result = win.module.print_file(None, str(path), None, raw=True)
+
+    assert result["code"] == 503, result
+    assert win.win32print.written == []
+    _assert_nothing_touched_the_device(win.calls)
+
+
+def test_online_printer_still_prints_with_attribute_bit_clear(win):
+    win.win32print.attributes = 0
+    result = win.module.print_file(None, _pdf(win.tmp_path), None)
+    assert result["code"] == 200, result
+    assert ("StartDoc", "doc.pdf") in win.calls

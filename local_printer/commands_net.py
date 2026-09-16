@@ -84,11 +84,33 @@ def diagnose(deep: bool = True, timeout: float = 1.0) -> Dict[str, Any]:
             "is_default": printer.get("is_default", False),
         }
         port_name = str(printer.get("port") or "")
-        host = (
-            discovery.host_of(port_name)
-            or discovery.host_of(printer.get("uri"))
-            or discovery.host_of(printer.get("location"))
-        )
+        # First candidate that yields an address wins; if none does but one of
+        # them named a host we could not resolve, remember that so the queue is
+        # reported as unresolved rather than silently treated as local.
+        host: Optional[str] = None
+        unresolved: Optional[Dict[str, Any]] = None
+        for candidate in (port_name, printer.get("uri"), printer.get("location")):
+            resolution = discovery.resolve_host(candidate)
+            if resolution is None:
+                continue
+            if resolution.get("address"):
+                host = resolution["address"]
+                if resolution.get("hostname") and resolution["hostname"] != host:
+                    entry["hostname"] = resolution["hostname"]
+                break
+            unresolved = unresolved or resolution
+        if not host and unresolved:
+            entry["kind"] = "network-unresolved"
+            entry["hostname"] = unresolved.get("hostname")
+            entry["really_online"] = None
+            entry["verdict"] = f"UNRESOLVED - {unresolved.get('reason')}"
+            entry["hint"] = (
+                "check that the name is still valid on this network (mDNS/.local "
+                "names need the printer to be powered on and Bonjour/Avahi to be "
+                "running), or re-add the queue using the printer's IP address"
+            )
+            results.append(entry)
+            continue
         if not host and port_name.upper().startswith("WSD-"):
             # Windows WSD/IPP pairing ports resolve the device by UUID at print
             # time; the port itself stores no address we could probe.

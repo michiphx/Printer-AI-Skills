@@ -1,6 +1,12 @@
 """Unit tests for the dataclasses in models/model.py."""
 
-from models.model import APIResponse, Printer, PrinterStatus, PrintJob
+from models.model import (
+    APIResponse,
+    LinuxPrintOptions,
+    Printer,
+    PrinterStatus,
+    PrintJob,
+)
 
 
 class TestPrinterFromDict:
@@ -143,3 +149,94 @@ class TestAPIResponse:
     def test_unsupported_media_type_default_data(self):
         resp = APIResponse.unsupported_media_type("msg", None)
         assert resp.data == {}
+
+
+class TestLinuxPrintOptions:
+    """to_dict() must speak CUPS: hyphenated IPP names, string values only."""
+
+    def test_to_dict_emits_ipp_names_and_string_values(self):
+        opts = LinuxPrintOptions.from_dict(
+            {"print_color_mode": "monochrome", "copies": 2}
+        )
+        as_dict = opts.to_dict()
+        assert as_dict == {"print-color-mode": "monochrome", "copies": "2"}
+        for key, value in as_dict.items():
+            assert "_" not in key, f"{key!r} is not an IPP attribute name"
+            assert isinstance(value, str), f"{key}={value!r} is not a str"
+
+    def test_every_underscored_field_is_translated(self):
+        opts = LinuxPrintOptions(
+            copies="2",
+            media="A4",
+            sides="two-sided-long-edge",
+            orientation_requested="4",
+            print_color_mode="color",
+            print_quality="4",
+            page_ranges="1-5",
+            number_up="2",
+            fit_to_page="true",
+            media_source="tray-1",
+            media_type="photographic",
+            scaling="100",
+            resolution="600dpi",
+        )
+        assert set(opts.to_dict()) == {
+            "copies",
+            "media",
+            "sides",
+            "orientation-requested",
+            "print-color-mode",
+            "print-quality",
+            "page-ranges",
+            "number-up",
+            "fit-to-page",
+            "media-source",
+            "media-type",
+            "scaling",
+            "resolution",
+        }
+
+    def test_bools_and_ints_are_coerced_to_cups_strings(self):
+        opts = LinuxPrintOptions.from_dict(
+            {"fit_to_page": True, "number_up": 4, "copies": 3, "custom-flag": False}
+        )
+        as_dict = opts.to_dict()
+        assert as_dict["fit-to-page"] == "true"
+        assert as_dict["custom-flag"] == "false"
+        assert as_dict["number-up"] == "4"
+        assert as_dict["copies"] == "3"
+        assert all(isinstance(v, str) for v in as_dict.values())
+
+    def test_from_dict_accepts_hyphenated_ipp_keys(self):
+        opts = LinuxPrintOptions.from_dict(
+            {"print-color-mode": "color", "orientation-requested": "4", "copies": "1"}
+        )
+        assert opts.print_color_mode == "color"
+        assert opts.orientation_requested == "4"
+        assert opts.copies == "1"
+        assert opts.extra_options is None
+        assert opts.to_dict() == {
+            "print-color-mode": "color",
+            "orientation-requested": "4",
+            "copies": "1",
+        }
+
+    def test_snake_and_hyphen_input_produce_the_same_dict(self):
+        snake = LinuxPrintOptions.from_dict({"print_color_mode": "color", "number_up": 2})
+        ipp = LinuxPrintOptions.from_dict({"print-color-mode": "color", "number-up": "2"})
+        assert snake.to_dict() == ipp.to_dict()
+
+    def test_unknown_keys_survive_untouched_in_extra_options(self):
+        opts = LinuxPrintOptions.from_dict({"copies": "1", "ColorModel": "RGB"})
+        assert opts.extra_options == {"ColorModel": "RGB"}
+        assert opts.to_dict() == {"copies": "1", "ColorModel": "RGB"}
+
+    def test_none_values_are_dropped(self):
+        opts = LinuxPrintOptions.from_dict({"copies": None, "media": "A4"})
+        assert opts.to_dict() == {"media": "A4"}
+
+    def test_does_not_mutate_input(self):
+        data = {"print-color-mode": "color", "copies": 2}
+        original = dict(data)
+        LinuxPrintOptions.from_dict(data)
+        assert data == original

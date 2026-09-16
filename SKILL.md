@@ -104,7 +104,7 @@ printer-ai print /path/to/report.docx             # no --index → the default p
 printer-ai print /path/to/photo.jpg --index 2     # a specific printer
 
 # macOS/Linux (CUPS/IPP option names)
-printer-ai print report.docx --options '{"copies":"2","media":"A4","orientation_requested":"3","print_color_mode":"color"}'
+printer-ai print report.docx --options '{"copies":"2","media":"A4","orientation-requested":"3","print-color-mode":"color"}'
 
 # Windows (DEVMODE option names)
 printer-ai print report.docx --options '{"dmCopies":2,"dmPaperSize":9,"dmOrientation":1,"dmColor":2}'
@@ -166,21 +166,21 @@ what they say; pick the column for the platform you are on.
 
 | User says | macOS/Linux (CUPS/IPP) | Windows (DEVMODE) |
 |---|---|---|
-| "black and white" / "grayscale" | `{"print_color_mode":"monochrome"}` | `{"dmColor":1}` |
-| "in colour" | `{"print_color_mode":"color"}` | `{"dmColor":2}` |
+| "black and white" / "grayscale" | `{"print-color-mode":"monochrome"}` | `{"dmColor":1}` |
+| "in colour" | `{"print-color-mode":"color"}` | `{"dmColor":2}` |
 | "double-sided" / "duplex" | `{"sides":"two-sided-long-edge"}` | `{"dmDuplex":2}` |
 | "double-sided, flip on the short edge" | `{"sides":"two-sided-short-edge"}` | `{"dmDuplex":3}` |
 | "single-sided" | `{"sides":"one-sided"}` | `{"dmDuplex":1}` |
 | "3 copies" | `{"copies":"3"}` | `{"dmCopies":3}` |
-| "landscape" | `{"orientation_requested":"4"}` | `{"dmOrientation":2}` |
-| "portrait" | `{"orientation_requested":"3"}` | `{"dmOrientation":1}` |
-| "pages 2 to 5" | `{"page_ranges":"2-5"}` | not a DEVMODE field — convert the range yourself first (e.g. `printer-ai convert`, then print a trimmed PDF), or print the whole document |
+| "landscape" | `{"orientation-requested":"4"}` | `{"dmOrientation":2}` |
+| "portrait" | `{"orientation-requested":"3"}` | `{"dmOrientation":1}` |
+| "pages 2 to 5" | `{"page-ranges":"2-5"}` | not a DEVMODE field — convert the range yourself first (e.g. `printer-ai convert`, then print a trimmed PDF), or print the whole document |
 | "on Letter" / "on A4" | `{"media":"Letter"}` / `{"media":"A4"}` | `{"dmPaperSize":1}` / `{"dmPaperSize":9}` |
-| "draft quality" | `{"print_quality":"3"}` | `{"dmPrintQuality":-1}` |
-| "2 pages per sheet" | `{"number_up":"2"}` | not a DEVMODE field — no CLI equivalent |
+| "draft quality" | `{"print-quality":"3"}` | `{"dmPrintQuality":-1}` |
+| "2 pages per sheet" | `{"number-up":"2"}` | not a DEVMODE field — no CLI equivalent |
 
 Combine freely: "in colour, double-sided, 2 copies" →
-`'{"print_color_mode":"color","sides":"two-sided-long-edge","copies":"2"}'` on
+`'{"print-color-mode":"color","sides":"two-sided-long-edge","copies":"2"}'` on
 macOS/Linux, `'{"dmColor":2,"dmDuplex":2,"dmCopies":2}'` on Windows.
 
 Two things to keep in mind:
@@ -209,12 +209,18 @@ printer-ai cancel-job JOB_ID
 |--------|--------------|-------------|
 | `copies` | `"2"` | Number of copies |
 | `media` | `"A4"`, `"Letter"` | Paper size |
-| `orientation_requested` | `"3"`=portrait, `"4"`=landscape | Orientation |
-| `print_color_mode` | `"monochrome"`, `"color"` | Color mode |
+| `orientation-requested` | `"3"`=portrait, `"4"`=landscape | Orientation |
+| `print-color-mode` | `"monochrome"`, `"color"` | Color mode |
 | `sides` | `"one-sided"`, `"two-sided-long-edge"` | Duplex |
-| `print_quality` | `"3"`=draft, `"4"`=normal, `"5"`=high | Quality |
-| `page_ranges` | `"1-5,10-15"` | Page range |
-| `number_up` | `"2"`, `"4"` | Pages per sheet |
+| `print-quality` | `"3"`=draft, `"4"`=normal, `"5"`=high | Quality |
+| `page-ranges` | `"1-5,10-15"` | Page range |
+| `number-up` | `"2"`, `"4"` | Pages per sheet |
+| `fit-to-page` | `"true"`, `"false"` | Scale to fit the media |
+
+Names are the hyphenated IPP attribute names; the snake_case spellings
+(`print_color_mode`) are accepted as aliases. Every value is handed to CUPS as a
+string, so `{"copies": 2}` and `{"copies": "2"}` both arrive as
+`{"copies": "2", "media": "A4", "print-color-mode": "color"}`-style dicts.
 
 ### Windows (DEVMODE format)
 

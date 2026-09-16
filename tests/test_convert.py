@@ -672,6 +672,17 @@ class FakeCOMApp:
         self.kind = kind
         self.Visible = True
         self.DisplayAlerts = True
+        self._automation_security = None
+
+    @property
+    def AutomationSecurity(self):
+        return self._automation_security
+
+    @AutomationSecurity.setter
+    def AutomationSecurity(self, value):
+        # Logged so a test can prove it was set *before* any Open call.
+        self.log.append(("automation_security", self.kind, value))
+        self._automation_security = value
 
     @property
     def Documents(self):
@@ -768,8 +779,94 @@ class TestOfficeCOM:
 
     def test_unknown_extension_for_com(self, tmp_path, fake_com):
         source = write(tmp_path / "thing.odg", "x")
-        with pytest.raises(convert.ConversionError):
+        with pytest.raises(convert.ConversionError) as exc_info:
             convert.OfficeConverter().convert_with_com(source, str(tmp_path / "o.pdf"))
+        assert exc_info.value.code == 415
+        # Nothing was dispatched for a format no Office app handles.
+        assert not [e for e in fake_com if e[0] == "dispatch"]
+
+    @pytest.mark.parametrize(
+        "name, prog_id",
+        [
+            ("letter.docx", "Word.Application"),
+            ("sheet.xlsx", "Excel.Application"),
+            ("deck.pptx", "PowerPoint.Application"),
+        ],
+    )
+    def test_macros_are_disabled_before_the_document_is_opened(
+        self, tmp_path, fake_com, name, prog_id
+    ):
+        source = write(tmp_path / name, "x")
+        convert.OfficeConverter().convert_with_com(source, str(tmp_path / "o.pdf"))
+
+        kinds = [e[0] for e in fake_com]
+        assert ("automation_security", prog_id, 3) in fake_com  # msoAutomationSecurityForceDisable
+        assert kinds.index("automation_security") > kinds.index("dispatch")
+        assert kinds.index("automation_security") < kinds.index("open")
+
+    def test_word_opens_with_macro_safe_flags(self, tmp_path, fake_com):
+        source = write(tmp_path / "letter.docx", "x")
+        convert.OfficeConverter().convert_with_com(source, str(tmp_path / "o.pdf"))
+        opened = [e for e in fake_com if e[0] == "open"][0]
+        flags = opened[3]
+        assert flags["ReadOnly"] is True
+        assert flags["AddToRecentFiles"] is False
+        assert flags["ConfirmConversions"] is False
+        assert flags["OpenAndRepair"] is False
+
+    def test_excel_opens_without_updating_links(self, tmp_path, fake_com):
+        source = write(tmp_path / "sheet.xlsx", "x")
+        convert.OfficeConverter().convert_with_com(source, str(tmp_path / "o.pdf"))
+        opened = [e for e in fake_com if e[0] == "open"][0]
+        assert opened[3]["ReadOnly"] is True
+        assert opened[3]["UpdateLinks"] == 0
+
+    def test_hung_office_times_out_and_is_quit(self, tmp_path, fake_com, monkeypatch):
+        import threading
+
+        never = threading.Event()
+
+        def block_forever(self, path, **kwargs):
+            self.log.append(("open", self.kind, path, kwargs))
+            never.wait()  # a modal dialog nobody will ever click away
+
+        monkeypatch.setattr(FakeCOMCollection, "Open", block_forever)
+        source = write(tmp_path / "letter.docx", "x")
+
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.OfficeConverter().convert_with_com(
+                source, str(tmp_path / "o.pdf"), timeout=0.2
+            )
+        never.set()  # let the abandoned worker thread finish
+
+        assert exc_info.value.code == 504
+        assert "timed out" in str(exc_info.value)
+        assert ("quit", "Word.Application", None) in fake_com
+
+    def test_timeout_comes_from_the_environment(self, tmp_path, fake_com, monkeypatch):
+        import threading
+
+        never = threading.Event()
+
+        def block_forever(self, path, **kwargs):
+            never.wait()
+
+        monkeypatch.setattr(FakeCOMCollection, "Open", block_forever)
+        monkeypatch.setenv("PRINTER_AI_COM_TIMEOUT", "0.2")
+        source = write(tmp_path / "letter.docx", "x")
+
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.OfficeConverter().convert_with_com(source, str(tmp_path / "o.pdf"))
+        never.set()
+        assert exc_info.value.code == 504
+        assert "0s" in str(exc_info.value)  # formatted from the 0.2s override
+
+    @pytest.mark.parametrize("raw, expected", [
+        ("", 60.0), ("30", 30.0), ("0", 60.0), ("-5", 60.0), ("soon", 60.0),
+    ])
+    def test_com_timeout_parsing(self, monkeypatch, raw, expected):
+        monkeypatch.setenv("PRINTER_AI_COM_TIMEOUT", raw)
+        assert convert._com_timeout() == expected
 
     def test_com_is_preferred_then_falls_back(self, tmp_path, monkeypatch, fake_com):
         """When COM blows up, LibreOffice still gets its turn."""
@@ -928,6 +1025,121 @@ class TestErrors:
         with pytest.raises(convert.ConversionError) as exc_info:
             convert._run_tool(["x"], 1.0, "thing")
         assert "exit code 3" in str(exc_info.value)
+
+    def test_error_code_defaults_to_415(self):
+        assert convert.ConversionError("x").code == 415
+
+
+class TestErrorCodes:
+    """ConversionError.code tells the caller whose fault a failure is."""
+
+    def test_empty_file_is_422(self, tmp_path):
+        path = tmp_path / "empty.docx"
+        path.write_bytes(b"")
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.to_pdf(str(path))
+        assert exc_info.value.code == 422
+
+    def test_missing_file_is_404(self, tmp_path):
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.to_pdf(str(tmp_path / "nope.txt"))
+        assert exc_info.value.code == 404
+
+    def test_unsupported_format_is_415(self, tmp_path):
+        path = tmp_path / "thing.bin"
+        path.write_bytes(b"\x00\x01\xff\xfe" * 32)
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.to_pdf(str(path))
+        assert exc_info.value.code == 415
+
+    @needs_pillow
+    @needs_reportlab
+    def test_corrupt_image_is_422(self, tmp_path):
+        path = tmp_path / "broken.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"garbage" * 4)
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.to_pdf(str(path), out_dir=str(tmp_path / "out"))
+        assert exc_info.value.code == 422
+
+    def test_missing_tool_is_415(self, tmp_path, no_external_tools):
+        import zipfile
+
+        path = tmp_path / "report.docx"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types/>")
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.to_pdf(str(path))
+        assert exc_info.value.code == 415
+        assert exc_info.value.hint
+
+    def test_tool_timeout_is_504(self, monkeypatch):
+        import subprocess
+
+        def timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=1)
+
+        monkeypatch.setattr(subprocess, "run", timeout)
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert._run_tool(["x"], 1.0, "thing")
+        assert exc_info.value.code == 504
+
+    def test_tool_nonzero_exit_is_500(self, monkeypatch):
+        import subprocess
+
+        class Proc:
+            returncode = 3
+            stdout = b"it broke"
+
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: Proc())
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert._run_tool(["x"], 1.0, "thing")
+        assert exc_info.value.code == 500
+
+    def test_tool_binary_vanished_is_415(self, monkeypatch):
+        import subprocess
+
+        def gone(*args, **kwargs):
+            raise FileNotFoundError("soffice")
+
+        monkeypatch.setattr(subprocess, "run", gone)
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert._run_tool(["soffice"], 1.0, "LibreOffice")
+        assert exc_info.value.code == 415
+
+    def test_libreoffice_silently_producing_nothing_is_422(self, tmp_path, monkeypatch):
+        """LibreOffice exits 0 but writes no PDF for corrupt/encrypted files."""
+        monkeypatch.setattr(convert, "find_soffice", lambda: "/fake/soffice")
+        monkeypatch.setattr(convert, "_run_tool", lambda cmd, timeout, what: None)
+        source = write(tmp_path / "locked.docx", "x")
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.OfficeConverter().convert_with_libreoffice(source, str(tmp_path), [])
+        assert exc_info.value.code == 422
+        assert "password" in exc_info.value.hint
+
+    def test_converter_crash_is_500(self, tmp_path, monkeypatch):
+        source = write(tmp_path / "notes.txt", "hello\n")
+
+        def explode(self, source, out_dir, notes):
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(convert.TextConverter, "convert", explode)
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.to_pdf(source)
+        assert exc_info.value.code == 500
+        assert "kaboom" in str(exc_info.value)
+
+    def test_code_survives_the_to_pdf_wrapper(self, tmp_path, monkeypatch):
+        """to_pdf re-raises a converter's ConversionError with its code intact."""
+        source = write(tmp_path / "notes.txt", "hello\n")
+
+        def slow(self, source, out_dir, notes):
+            raise convert.ConversionError("tool timed out", code=504)
+
+        monkeypatch.setattr(convert.TextConverter, "convert", slow)
+        with pytest.raises(convert.ConversionError) as exc_info:
+            convert.to_pdf(source)
+        assert exc_info.value.code == 504
+        assert exc_info.value.converter == "text"
 
     def test_run_tool_never_uses_a_shell(self, monkeypatch):
         import subprocess
