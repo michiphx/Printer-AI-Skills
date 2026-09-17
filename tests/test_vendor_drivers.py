@@ -358,3 +358,49 @@ class TestGetJson:
         req = captured["request"]
         assert req.get_header("User-agent") == vendor_drivers.BROWSER_UA
         assert req.get_header("Referer") == vendor_drivers.EPSON_PAGE
+
+
+class TestEpsonLookupSorting:
+    def _lookup_with_items(self, monkeypatch, items):
+        # Stub the network: epson_lookup only sees the fake API payload.
+        monkeypatch.setattr(vendor_drivers, "_get_json", lambda *a, **k: {"items": items})
+        return vendor_drivers.epson_lookup("SPT_C11CJ60401", "US", "w11", "en")
+
+    def test_best_download_is_highest_numeric_version(self, monkeypatch):
+        items = [
+            {"cti_category": "Drivers", "version": "2.68", "url": "https://x/a.exe"},
+            {"cti_category": "Drivers", "version": "10.01", "url": "https://x/b.exe"},
+            {"cti_category": "Drivers", "version": "3.0", "url": "https://x/c.exe"},
+            {"cti_category": "Drivers", "version": "beta", "url": "https://x/d.exe"},
+            {"cti_category": "Firmware", "version": "99.0", "url": "https://x/fw.exe"},
+        ]
+        result = self._lookup_with_items(monkeypatch, items)
+
+        versions = [d["version"] for d in result["downloads"]]
+        assert versions == ["10.01", "3.0", "2.68", "beta"]
+        assert result["downloads"][0]["version"] == "10.01"
+
+    def test_drivers_category_beats_combo_regardless_of_version(self, monkeypatch):
+        items = [
+            {"cti_category": "ComboPackage", "version": "50.0", "url": "https://x/combo.exe"},
+            {"cti_category": "Drivers", "version": "2.68", "url": "https://x/drv.exe"},
+            {"cti_category": "ComboPackage", "version": "7.1", "url": "https://x/combo2.exe"},
+        ]
+        result = self._lookup_with_items(monkeypatch, items)
+
+        assert [(d["category"], d["version"]) for d in result["downloads"]] == [
+            ("Drivers", "2.68"),
+            ("ComboPackage", "50.0"),
+            ("ComboPackage", "7.1"),
+        ]
+
+    @pytest.mark.parametrize(
+        "newer, older",
+        [("10.01", "2.68"), ("3.0", "2.68"), ("1.2.10", "1.2.9"), ("1.2b", "1.2"), ("1.0", "beta"), ("1.0", None)],
+    )
+    def test_parse_version_ordering(self, newer, older):
+        assert vendor_drivers._parse_version(newer) > vendor_drivers._parse_version(older)
+
+    def test_parse_version_never_raises(self):
+        for junk in ("", None, "...", "v", "1..2", "a.b.c", 42):
+            vendor_drivers._parse_version(junk)

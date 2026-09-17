@@ -530,6 +530,78 @@ def test_explicit_orientation_wins_over_auto_landscape(win):
     assert win.devmode.Orientation == 1
 
 
+# ------------------------------------------- cross-dialect options (R3-05)
+
+
+def test_cups_style_options_reach_the_devmode(win):
+    from models.model import WindowsPrintOptions
+
+    win.win32print.dc_copies = 99
+    options = WindowsPrintOptions.from_dict(
+        {"copies": 2, "print-color-mode": "color", "sides": "two-sided-long-edge"}
+    )
+    result = win.module.print_file(None, _pdf(win.tmp_path), options)
+
+    assert result["code"] == 200, result
+    assert result["data"]["copies"] == 2
+    assert "ignored_options" not in result["data"]
+    assert win.devmode.Copies == 2
+    assert win.devmode.Color == 2
+    assert win.devmode.Duplex == 2
+    assert win.devmode.Fields & _WIN32CON.DM_COPIES
+    assert win.devmode.Fields & _WIN32CON.DM_COLOR
+    assert win.devmode.Fields & _WIN32CON.DM_DUPLEX
+
+
+def test_unmapped_options_are_reported_as_ignored_on_gdi_path(win, caplog, monkeypatch):
+    from models.model import WindowsPrintOptions
+    from utils.logger import logger as printer_logger
+
+    # utils.logger sets propagate=False by design (never let a host app's
+    # logging config swallow or duplicate our records) - which also keeps
+    # them from reaching caplog's handler on the root logger. Force
+    # propagation for the duration of this test only.
+    monkeypatch.setattr(printer_logger, "propagate", True)
+
+    options = WindowsPrintOptions.from_dict(
+        {"dmColor": 2, "media": "A4", "print-quality": "5", "fit-to-page": "true"}
+    )
+    with caplog.at_level("WARNING", logger="printer-ai"):
+        result = win.module.print_file(None, _pdf(win.tmp_path), options)
+
+    assert result["code"] == 200, result
+    assert result["data"]["ignored_options"] == ["fit-to-page", "media", "print-quality"]
+    assert win.devmode.Color == 2  # the mapped option is still honoured
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings and "media" in warnings[0].getMessage()
+
+
+def test_unmapped_options_are_reported_as_ignored_on_raw_path(win):
+    from models.model import WindowsPrintOptions
+
+    path = win.tmp_path / "job.prn"
+    path.write_bytes(b"\x1b%-12345X@PJL\n")
+    options = WindowsPrintOptions.from_dict({"number-up": "2"})
+    result = win.module.print_file(None, str(path), options)
+
+    assert result["code"] == 200, result
+    assert result["data"]["method"] == "raw"
+    assert result["data"]["ignored_options"] == ["number-up"]
+
+
+def test_no_ignored_options_key_when_everything_mapped(win):
+    from models.model import WindowsPrintOptions
+
+    result = win.module.print_file(
+        None, _pdf(win.tmp_path), WindowsPrintOptions(dmColor=1)
+    )
+    assert result["code"] == 200, result
+    assert "ignored_options" not in result["data"]
+
+    result = win.module.print_file(None, _pdf(win.tmp_path), None)
+    assert "ignored_options" not in result["data"]
+
+
 # -------------------------------------------------------------------- copies
 
 

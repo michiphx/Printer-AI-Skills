@@ -1,11 +1,14 @@
 """Unit tests for the dataclasses in models/model.py."""
 
+import pytest
+
 from models.model import (
     APIResponse,
     LinuxPrintOptions,
     Printer,
     PrinterStatus,
     PrintJob,
+    WindowsPrintOptions,
 )
 
 
@@ -239,4 +242,103 @@ class TestLinuxPrintOptions:
         data = {"print-color-mode": "color", "copies": 2}
         original = dict(data)
         LinuxPrintOptions.from_dict(data)
+        assert data == original
+
+
+class TestWindowsPrintOptions:
+    """from_dict() translates CUPS-style keys to DEVMODE fields (R3-05).
+
+    Whatever it cannot translate stays in extra_options, which the Windows
+    backend reports as ignored_options instead of silently dropping.
+    """
+
+    def test_dm_keys_are_taken_as_is(self):
+        opts = WindowsPrintOptions.from_dict({"dmCopies": 2, "dmColor": 1})
+        assert opts.dmCopies == 2
+        assert opts.dmColor == 1
+        assert opts.extra_options is None
+
+    def test_cups_dialect_maps_to_devmode(self):
+        opts = WindowsPrintOptions.from_dict(
+            {
+                "copies": 2,
+                "print-color-mode": "color",
+                "sides": "two-sided-long-edge",
+                "orientation-requested": "4",
+            }
+        )
+        assert opts.dmCopies == 2
+        assert opts.dmColor == 2
+        assert opts.dmDuplex == 2
+        assert opts.dmOrientation == 2
+        assert opts.extra_options is None
+
+    @pytest.mark.parametrize(
+        "key,value,field,expected",
+        [
+            ("print-color-mode", "monochrome", "dmColor", 1),
+            ("print-color-mode", "color", "dmColor", 2),
+            ("print-color-mode", "Color", "dmColor", 2),
+            ("sides", "one-sided", "dmDuplex", 1),
+            ("sides", "two-sided-long-edge", "dmDuplex", 2),
+            ("sides", "two-sided-short-edge", "dmDuplex", 3),
+            ("orientation-requested", "3", "dmOrientation", 1),
+            ("orientation-requested", "4", "dmOrientation", 2),
+            ("orientation-requested", 4, "dmOrientation", 2),
+            ("copies", "3", "dmCopies", 3),
+            ("copies", 1, "dmCopies", 1),
+        ],
+    )
+    def test_each_translation(self, key, value, field, expected):
+        opts = WindowsPrintOptions.from_dict({key: value})
+        assert getattr(opts, field) == expected
+        assert opts.extra_options is None
+
+    def test_snake_case_cups_keys_are_accepted_too(self):
+        opts = WindowsPrintOptions.from_dict(
+            {"print_color_mode": "monochrome", "orientation_requested": "3"}
+        )
+        assert opts.dmColor == 1
+        assert opts.dmOrientation == 1
+        assert opts.extra_options is None
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("print-color-mode", "auto"),
+            ("sides", "booklet"),
+            ("orientation-requested", "5"),
+            ("copies", "lots"),
+            ("copies", 0),
+            ("copies", True),
+            ("print-color-mode", False),
+        ],
+    )
+    def test_untranslatable_values_stay_in_extra_options(self, key, value):
+        opts = WindowsPrintOptions.from_dict({key: value})
+        assert opts.extra_options == {key: value}
+        assert all(
+            getattr(opts, f) is None
+            for f in ("dmCopies", "dmColor", "dmDuplex", "dmOrientation")
+        )
+
+    def test_unknown_keys_stay_in_extra_options(self):
+        opts = WindowsPrintOptions.from_dict({"copies": 2, "media": "A4", "fit-to-page": "true"})
+        assert opts.dmCopies == 2
+        assert opts.extra_options == {"media": "A4", "fit-to-page": "true"}
+
+    def test_explicit_dm_field_wins_over_cups_key(self):
+        opts = WindowsPrintOptions.from_dict({"dmColor": 1, "print-color-mode": "color"})
+        assert opts.dmColor == 1
+        # the losing key is still visible so the backend can report it
+        assert opts.extra_options == {"print-color-mode": "color"}
+
+    def test_to_dict_round_trip_keeps_translated_fields_and_extras(self):
+        opts = WindowsPrintOptions.from_dict({"copies": 2, "media": "A4"})
+        assert opts.to_dict() == {"dmCopies": 2, "media": "A4"}
+
+    def test_does_not_mutate_input(self):
+        data = {"print-color-mode": "color", "copies": 2, "media": "A4"}
+        original = dict(data)
+        WindowsPrintOptions.from_dict(data)
         assert data == original

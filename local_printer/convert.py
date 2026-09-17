@@ -349,6 +349,11 @@ def pdf_is_encrypted(path: str) -> bool:
     Not a PDF parser - it looks for ``/Encrypt`` in the last couple of
     kilobytes, which is where the trailer (or the cross-reference stream
     dictionary) of an encrypted file lives.
+
+    True here does NOT mean the file needs a password: PDFs whose only
+    protection is an owner password (permission flags such as "no printing")
+    have an empty user password and open everywhere. Use
+    :func:`pdf_encryption_status` to tell the two apart.
     """
     try:
         size = os.path.getsize(path)
@@ -358,6 +363,229 @@ def pdf_is_encrypted(path: str) -> bool:
     except OSError:
         return False
     return b"/Encrypt" in tail
+
+
+#: pdf_encryption_status() verdicts.
+PDF_NOT_ENCRYPTED = "none"       # no /Encrypt in the trailer
+PDF_OPENS_WITHOUT_PASSWORD = "open"   # encrypted, but the user password is empty
+PDF_NEEDS_PASSWORD = "locked"    # encrypted and the empty user password is wrong
+PDF_ENCRYPTION_UNKNOWN = "unknown"    # encrypted in a way this module cannot verify
+
+#: Largest PDF whose body is scanned for the /Encrypt object.
+_PDF_ENCRYPT_SCAN_LIMIT = 64 * 1024 * 1024
+
+#: Standard security handler password padding (PDF 32000-1:2008, 7.6.3.3).
+_PDF_PASSWORD_PAD = bytes([
+    0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56,
+    0xFF, 0xFA, 0x01, 0x08, 0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80,
+    0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
+])
+
+
+def _rc4(key: bytes, data: bytes) -> bytes:
+    """Plain RC4 - a few lines, so no crypto dependency is needed."""
+    s = list(range(256))
+    j = 0
+    klen = len(key)
+    for i in range(256):
+        j = (j + s[i] + key[i % klen]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+    out = bytearray()
+    i = j = 0
+    for byte in data:
+        i = (i + 1) & 0xFF
+        j = (j + s[i]) & 0xFF
+        s[i], s[j] = s[j], s[i]
+        out.append(byte ^ s[(s[i] + s[j]) & 0xFF])
+    return bytes(out)
+
+
+def _pdf_string(token: bytes) -> Optional[bytes]:
+    """Decode a PDF hex ``<...>`` or literal ``(...)`` string token."""
+    import binascii
+    import re
+
+    token = token.strip()
+    if token.startswith(b"<"):
+        hexdigits = re.sub(rb"[^0-9A-Fa-f]", b"", token[1:token.find(b">")])
+        if len(hexdigits) % 2:
+            hexdigits += b"0"
+        try:
+            return binascii.unhexlify(hexdigits)
+        except (binascii.Error, ValueError):
+            return None
+    if not token.startswith(b"("):
+        return None
+    out = bytearray()
+    i, depth = 1, 1
+    escapes = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f"}
+    while i < len(token):
+        ch = token[i:i + 1]
+        if ch == b"\\":
+            nxt = token[i + 1:i + 2]
+            if nxt in escapes:
+                out += escapes[nxt]
+                i += 2
+            elif nxt.isdigit():
+                digits = re.match(rb"[0-7]{1,3}", token[i + 1:]).group(0)
+                out.append(int(digits, 8) & 0xFF)
+                i += 1 + len(digits)
+            elif nxt in (b"\r", b"\n"):
+                i += 2
+                if nxt == b"\r" and token[i:i + 1] == b"\n":
+                    i += 1
+            else:
+                out += nxt
+                i += 2
+            continue
+        if ch == b"(":
+            depth += 1
+        elif ch == b")":
+            depth -= 1
+            if depth == 0:
+                break
+        out += ch
+        i += 1
+    return bytes(out)
+
+
+_PDF_STRING_TOKEN = rb"\s*(<[^>]*>|\((?:\\.|[^\\)])*\))"
+
+
+def _pdf_empty_user_password_opens(encrypt: bytes, first_id: bytes) -> str:
+    """Verify the empty user password against a standard-security /Encrypt dict.
+
+    Implements algorithms 2, 4 and 5 of PDF 32000-1 (revisions 2-4, RC4 or
+    AES-128) and the SHA-256 check of revision 5. Revision 6 (AES-256 with
+    the hardened hash) needs AES, which the standard library lacks, so it
+    reports "unknown" rather than guessing.
+    """
+    import hashlib
+    import re
+    import struct
+
+    def number(name: str, default: Optional[int] = None) -> Optional[int]:
+        match = re.search(rb"/" + name.encode() + rb"\s+(-?\d+)", encrypt)
+        return int(match.group(1)) if match else default
+
+    def string(name: str) -> Optional[bytes]:
+        match = re.search(rb"/" + name.encode() + _PDF_STRING_TOKEN, encrypt)
+        return _pdf_string(match.group(1)) if match else None
+
+    if not re.search(rb"/Filter\s*/Standard\b", encrypt):
+        return PDF_ENCRYPTION_UNKNOWN  # public-key or custom handler
+    revision = number("R")
+    owner, user = string("O"), string("U")
+    permissions = number("P")
+    if revision is None or owner is None or user is None or permissions is None:
+        return PDF_ENCRYPTION_UNKNOWN
+
+    if revision in (5, 6):
+        if len(user) < 48:
+            return PDF_ENCRYPTION_UNKNOWN
+        if revision == 6:
+            return PDF_ENCRYPTION_UNKNOWN
+        validation_salt = user[32:40]
+        ok = hashlib.sha256(validation_salt).digest() == user[:32]  # empty password + salt
+        return PDF_OPENS_WITHOUT_PASSWORD if ok else PDF_NEEDS_PASSWORD
+
+    if revision not in (2, 3, 4) or len(owner) < 32 or len(user) < 32:
+        return PDF_ENCRYPTION_UNKNOWN
+
+    length_bits = number("Length", 40) if revision >= 3 else 40
+    key_len = 5 if revision == 2 else max(5, min(16, (length_bits or 40) // 8))
+
+    # Algorithm 2: encryption key from the (empty, padded) user password.
+    material = _PDF_PASSWORD_PAD + owner[:32] + struct.pack("<i", permissions) + first_id
+    if revision >= 4 and re.search(rb"/EncryptMetadata\s+false", encrypt):
+        material += b"\xff\xff\xff\xff"
+    key = hashlib.md5(material).digest()
+    if revision >= 3:
+        for _ in range(50):
+            key = hashlib.md5(key[:key_len]).digest()
+    key = key[:key_len]
+
+    if revision == 2:
+        # Algorithm 4: /U is the padding string RC4-encrypted with the key.
+        ok = _rc4(key, _PDF_PASSWORD_PAD) == user[:32]
+    else:
+        # Algorithm 5: 20 RC4 rounds over MD5(pad + ID[0]); only 16 bytes count.
+        digest = hashlib.md5(_PDF_PASSWORD_PAD + first_id).digest()
+        value = _rc4(key, digest)
+        for i in range(1, 20):
+            value = _rc4(bytes(b ^ i for b in key), value)
+        ok = value[:16] == user[:16]
+    return PDF_OPENS_WITHOUT_PASSWORD if ok else PDF_NEEDS_PASSWORD
+
+
+def pdf_encryption_status(path: str) -> str:
+    """Can this PDF be opened without a password?
+
+    Returns one of :data:`PDF_NOT_ENCRYPTED`, :data:`PDF_OPENS_WITHOUT_PASSWORD`
+    (owner-password-only restrictions - the common "no printing" corporate
+    PDF, which every viewer and print backend opens fine),
+    :data:`PDF_NEEDS_PASSWORD` (a real user password is required) or
+    :data:`PDF_ENCRYPTION_UNKNOWN` (encrypted, but not in a way that can be
+    checked here). Only the "locked" verdict should stop a print: an unknown
+    file is best handed to the print backend, which raises a real error if
+    it truly cannot open it.
+    """
+    import re
+
+    if not pdf_is_encrypted(path):
+        return PDF_NOT_ENCRYPTED
+    try:
+        if os.path.getsize(path) > _PDF_ENCRYPT_SCAN_LIMIT:
+            return PDF_ENCRYPTION_UNKNOWN
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return PDF_ENCRYPTION_UNKNOWN
+
+    tail = data[-_PDF_TRAILER_WINDOW:]
+    # The trailer's /Encrypt is nearly always an indirect reference; the
+    # dictionary itself may not live inside an object stream (7.6.1), so a
+    # plain byte search finds it.
+    ref = re.search(rb"/Encrypt\s+(\d+)\s+(\d+)\s+R", tail)
+    if ref:
+        pattern = rb"(?<![0-9])" + ref.group(1) + rb"\s+" + ref.group(2) + rb"\s+obj\b"
+        matches = list(re.finditer(pattern, data))
+        if not matches:
+            return PDF_ENCRYPTION_UNKNOWN
+        start = matches[-1].end()  # incremental updates: the last one wins
+        end = data.find(b"endobj", start)
+        encrypt = data[start:end if end > 0 else start + 4096]
+    else:
+        inline = re.search(rb"/Encrypt\s*<<", tail)
+        if not inline:
+            return PDF_ENCRYPTION_UNKNOWN
+        start = inline.end() - 2
+        depth, i = 0, start
+        while i < len(tail) - 1:
+            pair = tail[i:i + 2]
+            if pair == b"<<":
+                depth += 1
+                i += 2
+                continue
+            if pair == b">>":
+                depth -= 1
+                i += 2
+                if depth == 0:
+                    break
+                continue
+            i += 1
+        encrypt = tail[start:i]
+
+    first_id = b""
+    id_match = re.search(rb"/ID\s*\[" + _PDF_STRING_TOKEN, tail)
+    if id_match:
+        first_id = _pdf_string(id_match.group(1)) or b""
+
+    try:
+        return _pdf_empty_user_password_opens(encrypt, first_id)
+    except Exception as exc:  # a malformed dictionary must never block a print
+        logger.debug("could not verify PDF encryption of %s: %s", path, exc)
+        return PDF_ENCRYPTION_UNKNOWN
 
 
 # ==================== page geometry ====================
@@ -573,32 +801,82 @@ def _com_timeout() -> float:
     return COM_TIMEOUT
 
 
+def _popen_group_kwargs() -> Dict[str, Any]:
+    """Popen keyword arguments that put the child in its own process group.
+
+    Browser launchers such as ``/usr/bin/brave-browser`` are shell wrappers
+    that do not ``exec`` the real binary, so killing only the direct child on
+    a timeout leaves the actual browser (and its helper processes) orphaned.
+    A dedicated group lets :func:`_kill_process_tree` take the whole tree down.
+    """
+    if _is_windows():
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
+
+
+def _kill_process_tree(proc: "subprocess.Popen[bytes]") -> None:
+    """Kill ``proc`` together with every descendant it spawned."""
+    import signal
+
+    if _is_windows():
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=10,
+            )
+        except Exception as exc:  # taskkill missing or itself hanging
+            logger.debug("taskkill failed for pid %s: %s", proc.pid, exc)
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        logger.debug("killpg failed for pid %s (%s); killing the child only", proc.pid, exc)
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def _run_tool(cmd: List[str], timeout: float, what: str) -> None:
     """Run an external converter, raising ConversionError on any failure.
 
-    Never uses a shell: the file name is data, not a command line.
+    Never uses a shell: the file name is data, not a command line. The tool
+    runs in its own process group so that a timeout kills its whole process
+    tree, not just a wrapper script.
     """
     logger.info("%s: running %s", what, cmd)
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        raise ConversionError(
-            f"{what} timed out after {timeout:.0f}s",
-            hint=f"The document may be too large or {what} is waiting for input.",
-            code=504,
+            **_popen_group_kwargs(),
         )
     except FileNotFoundError as exc:
         # The executable vanished between discovery and use: a missing tool.
         raise ConversionError(f"{what} could not be started: {exc}", code=415)
     except OSError as exc:
         raise ConversionError(f"{what} could not be started: {exc}", code=500)
-    output = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            proc.communicate(timeout=10)  # reap; the pipe closes once the tree is dead
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+        raise ConversionError(
+            f"{what} timed out after {timeout:.0f}s",
+            hint=f"The document may be too large or {what} is waiting for input.",
+            code=504,
+        )
+    output = (stdout or b"").decode("utf-8", "replace").strip()
     if output:
         logger.info("%s output: %s", what, output[:2000])
     if proc.returncode != 0:
@@ -1573,18 +1851,34 @@ def to_pdf(path: str, out_dir: Optional[str] = None) -> ConvertResult:
         )
 
     if isinstance(converter, PassthroughConverter):
-        if _looks_like_pdf(path) and pdf_is_encrypted(path):
+        status = pdf_encryption_status(path) if _looks_like_pdf(path) else PDF_NOT_ENCRYPTED
+        if status == PDF_NEEDS_PASSWORD:
             raise ConversionError(
-                "password-protected or encrypted PDF",
+                "password-protected PDF: a password is required to open it",
                 hint=(
-                    "The printer cannot open an encrypted PDF. Remove the "
-                    "password (e.g. print/export it to a new PDF from a viewer "
-                    "after entering the password) and print the result."
+                    "The printer cannot open a password-protected PDF. Remove "
+                    "the password (e.g. print/export it to a new PDF from a "
+                    "viewer after entering the password) and print the result."
                 ),
                 source_path=path,
                 detected=kind,
                 converter=converter.name,
                 code=422,
+            )
+        if status == PDF_OPENS_WITHOUT_PASSWORD:
+            # Owner-password-only files carry permission flags (often "no
+            # printing") but open without a password; the print backend
+            # decides what to do with the flags, so this is only informational.
+            notes.append(
+                "the PDF is encrypted with an owner password only (opens without "
+                "a password); its permission flags may restrict printing"
+            )
+        elif status == PDF_ENCRYPTION_UNKNOWN:
+            logger.info("%s is encrypted in a way that cannot be verified here; "
+                        "letting the print backend decide", path)
+            notes.append(
+                "the PDF is encrypted; could not verify whether it needs a "
+                "password - the printer will report an error if it does"
             )
         return ConvertResult(
             pdf_path=os.path.abspath(path),

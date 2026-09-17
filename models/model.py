@@ -170,6 +170,22 @@ class WindowsPrintOptions:
     # Extra options not defined above
     extra_options: Optional[Dict[str, Any]] = None
 
+    # CUPS/IPP keys with an obvious DEVMODE equivalent. An agent that learned
+    # the Linux dialect ({"copies": 2, "sides": "two-sided-long-edge"}) gets
+    # the same result on Windows instead of a silent no-op. Value maps are
+    # keyed by the IPP value; a value with no entry is left in extra_options
+    # (and reported as ignored) rather than guessed.
+    _CUPS_COPIES_KEYS = ("copies",)
+    _CUPS_VALUE_MAPS = {
+        # ipp key -> (dm field, {ipp value: dm value})
+        "print-color-mode": ("dmColor", {"monochrome": 1, "color": 2}),
+        "sides": (
+            "dmDuplex",
+            {"one-sided": 1, "two-sided-long-edge": 2, "two-sided-short-edge": 3},
+        ),
+        "orientation-requested": ("dmOrientation", {"3": 1, "4": 2}),
+    }
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary, excluding None values and merging extra_options"""
         result = {k: v for k, v in asdict(self).items() if v is not None and k != "extra_options"}
@@ -178,11 +194,51 @@ class WindowsPrintOptions:
         return result
 
     @classmethod
+    def _translate_cups_key(cls, key: str, value: Any) -> Optional[tuple]:
+        """Map one CUPS-style option to ``(dm_field, dm_value)``.
+
+        Accepts the hyphenated IPP spelling and the snake_case one the Linux
+        model also takes. Returns None when the key or the value has no clean
+        DEVMODE equivalent.
+        """
+        ipp_key = key.replace("_", "-")
+        if ipp_key in cls._CUPS_COPIES_KEYS:
+            if isinstance(value, bool):
+                return None
+            try:
+                copies = int(value)
+            except (TypeError, ValueError):
+                return None
+            return ("dmCopies", copies) if copies >= 1 else None
+        mapping = cls._CUPS_VALUE_MAPS.get(ipp_key)
+        if mapping is None or isinstance(value, bool):
+            return None
+        dm_field, values = mapping
+        dm_value = values.get(str(value).strip().lower())
+        return (dm_field, dm_value) if dm_value is not None else None
+
+    @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "WindowsPrintOptions":
-        """Create from dictionary, unknown keys are stored in extra_options"""
+        """Create from dictionary, unknown keys are stored in extra_options.
+
+        CUPS-style keys with a direct DEVMODE equivalent (``copies``,
+        ``print-color-mode``, ``sides``, ``orientation-requested``) are
+        translated to the matching dmXXX field. An explicit dmXXX key always
+        wins over a translated one. Anything else lands in extra_options.
+        """
         known_fields = {f.name for f in fields(cls)} - {"extra_options"}
         known = {k: v for k, v in data.items() if k in known_fields}
-        extra = {k: v for k, v in data.items() if k not in known_fields}
+        extra: Dict[str, Any] = {}
+        for k, v in data.items():
+            if k in known_fields:
+                continue
+            translated = cls._translate_cups_key(k, v)
+            if translated is not None and translated[0] not in known:
+                known[translated[0]] = translated[1]
+            else:
+                # No clean equivalent, or the caller also set the dmXXX field
+                # (dm wins): keep it visible so the backend can report it.
+                extra[k] = v
         return cls(**known, extra_options=extra if extra else None)
 
 

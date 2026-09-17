@@ -23,14 +23,15 @@ credentials or fetches data from the internet.
 """
 
 import ipaddress
+import queue
 import re
 import socket
 import ssl
 import struct
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 
@@ -577,6 +578,25 @@ NETWORK_URI_SCHEMES = frozenset({
 
 _IPV4_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
 
+# What a caller-supplied printer host may look like: a DNS/mDNS hostname made
+# of labels, or an IP literal (checked separately).  Mirrors the Windows setup
+# path's rule so `setup`/`probe` reject the same input on every platform.
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
+
+
+def valid_host(host: Any) -> bool:
+    """True if `host` is an IPv4/IPv6 literal or a plausible hostname.
+
+    Anything with whitespace, shell metacharacters, a URI scheme or brackets
+    is rejected so it never reaches a socket, a subprocess or a log line as a
+    "printer address".  This is a shape check, not a reachability one.
+    """
+    if not isinstance(host, str) or not host:
+        return False
+    if _ip_literal(host):
+        return True
+    return bool(_HOSTNAME_RE.match(host))
+
 
 def _ip_literal(value: Optional[str]) -> Optional[str]:
     """Return `value` if it is a literal IPv4/IPv6 address, else None."""
@@ -645,23 +665,34 @@ def _resolve_hostname(hostname: str, timeout: float = DEFAULT_RESOLVE_TIMEOUT) -
     Prefers an IPv4 answer when there is one, since that is what the rest of
     the probing stack is exercised against, else takes the first answer.
 
-    The lookup runs on a worker thread and is abandoned after `timeout`
-    seconds, which counts as a resolution failure.  The executor is shut down
-    without waiting so a hung resolver thread cannot hold up the caller.
+    The lookup runs on a daemon thread and is abandoned after `timeout`
+    seconds, which counts as a resolution failure.  A plain daemon thread is
+    used rather than a ThreadPoolExecutor on purpose: concurrent.futures joins
+    its worker threads at interpreter exit, so an abandoned getaddrinfo would
+    keep the whole process alive until the OS resolver gave up, long after
+    this function had returned.  Daemon threads do not block exit.
     """
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="resolve")
+    outcome: "queue.Queue[Tuple[bool, Any]]" = queue.Queue(maxsize=1)
+
+    def _lookup() -> None:
+        try:
+            outcome.put((True, socket.getaddrinfo(hostname, None)))
+        except BaseException as exc:  # noqa: BLE001 - relayed to the caller
+            outcome.put((False, exc))
+
+    worker = threading.Thread(target=_lookup, name="resolve", daemon=True)
+    worker.start()
     try:
-        future = pool.submit(socket.getaddrinfo, hostname, None)
-        infos = future.result(timeout=timeout)
-    except FutureTimeoutError:
+        ok, payload = outcome.get(timeout=timeout)
+    except queue.Empty:
         logger.debug(f"getaddrinfo({hostname!r}) timed out after {timeout}s")
-        future.cancel()
         return None
-    except (socket.gaierror, OSError) as exc:
-        logger.debug(f"getaddrinfo({hostname!r}) failed: {exc}")
-        return None
-    finally:
-        pool.shutdown(wait=False)
+    if not ok:
+        if isinstance(payload, (socket.gaierror, OSError)):
+            logger.debug(f"getaddrinfo({hostname!r}) failed: {payload}")
+            return None
+        raise payload
+    infos = payload
     first: Optional[str] = None
     for family, _type, _proto, _canon, sockaddr in infos:
         address = sockaddr[0] if sockaddr else None

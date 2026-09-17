@@ -1232,6 +1232,13 @@ class TestNativeExtensionIsVerified:
 
 
 class TestEncryptedPdf:
+    """A PDF that only *mentions* /Encrypt in its trailer is not necessarily
+    unprintable: an owner-password-only PDF (empty user password - common for
+    "no printing/copying" restrictions) opens everywhere and must pass
+    through unchanged. Only a PDF that genuinely needs a password to open is
+    rejected. See pdf_encryption_status(), which tells the two apart with the
+    standard security handler's own empty-user-password check (R3-01)."""
+
     @staticmethod
     def _pdf(encrypted):
         body = b"%PDF-1.6\n1 0 obj<</Type/Catalog>>endobj\n"
@@ -1241,15 +1248,54 @@ class TestEncryptedPdf:
         trailer += b">>\nstartxref\n0\n%%EOF\n"
         return body + trailer
 
-    def test_encrypted_pdf_is_422(self, tmp_path):
-        path = tmp_path / "secret.pdf"
-        path.write_bytes(self._pdf(encrypted=True))
+    @staticmethod
+    def _real_encrypted_pdf(path, *, user_password, owner_password):
+        """Build a genuinely RC4-encrypted PDF via reportlab, not a fixture
+        that merely mentions /Encrypt without a real dictionary behind it."""
+        from reportlab.lib import pdfencrypt
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+
+        enc = pdfencrypt.StandardEncryption(
+            userPassword=user_password, ownerPassword=owner_password,
+        )
+        c = canvas.Canvas(str(path), pagesize=A4, encrypt=enc)
+        c.drawString(100, 700, "hello")
+        c.save()
+
+    def test_owner_password_only_pdf_passes_through(self, tmp_path):
+        """Empty user password, owner-only restrictions: opens everywhere,
+        must not be rejected. This is the case R3-01 fixed a regression on."""
+        path = tmp_path / "owner-only.pdf"
+        self._real_encrypted_pdf(path, user_password="", owner_password="secret")
         assert convert.pdf_is_encrypted(str(path)) is True
+        assert convert.pdf_encryption_status(str(path)) == convert.PDF_OPENS_WITHOUT_PASSWORD
+        result = convert.to_pdf(str(path))
+        assert result.native is True and result.converted is False
+
+    def test_user_password_required_pdf_is_422(self, tmp_path):
+        """A real user password is required to open this one - reject it."""
+        path = tmp_path / "locked.pdf"
+        self._real_encrypted_pdf(path, user_password="realsecret", owner_password="ownersecret")
+        assert convert.pdf_is_encrypted(str(path)) is True
+        assert convert.pdf_encryption_status(str(path)) == convert.PDF_NEEDS_PASSWORD
         with pytest.raises(convert.ConversionError) as exc_info:
             convert.to_pdf(str(path))
         assert exc_info.value.code == 422
-        assert "encrypted" in str(exc_info.value)
+        assert "password" in str(exc_info.value).lower()
         assert exc_info.value.hint
+
+    def test_encrypt_mentioned_but_undecodable_dictionary_passes_through(self, tmp_path):
+        """A trailer that references /Encrypt but whose object cannot actually
+        be parsed (malformed/synthetic PDF) is PDF_ENCRYPTION_UNKNOWN, not a
+        confirmed lock - the safer default is to let it through rather than
+        block a file this module cannot actually verify."""
+        path = tmp_path / "secret.pdf"
+        path.write_bytes(self._pdf(encrypted=True))
+        assert convert.pdf_is_encrypted(str(path)) is True
+        assert convert.pdf_encryption_status(str(path)) == convert.PDF_ENCRYPTION_UNKNOWN
+        result = convert.to_pdf(str(path))
+        assert result.native is True and result.converted is False
 
     def test_plain_pdf_passes_through(self, tmp_path):
         path = tmp_path / "open.pdf"
@@ -1300,10 +1346,14 @@ class TestErrors:
     def test_timeout_becomes_a_conversion_error(self, monkeypatch):
         import subprocess
 
-        def timeout(*args, **kwargs):
-            raise subprocess.TimeoutExpired(cmd="x", timeout=1)
+        class Proc:
+            pid = 4242
 
-        monkeypatch.setattr(subprocess, "run", timeout)
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: Proc())
+        monkeypatch.setattr(convert, "_kill_process_tree", lambda proc: None)
         with pytest.raises(convert.ConversionError) as exc_info:
             convert._run_tool(["x"], 1.0, "thing")
         assert "timed out" in str(exc_info.value)
@@ -1313,9 +1363,12 @@ class TestErrors:
 
         class Proc:
             returncode = 3
-            stdout = b"it broke"
+            pid = 4242
 
-        monkeypatch.setattr(subprocess, "run", lambda *a, **k: Proc())
+            def communicate(self, timeout=None):
+                return b"it broke", None
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: Proc())
         with pytest.raises(convert.ConversionError) as exc_info:
             convert._run_tool(["x"], 1.0, "thing")
         assert "exit code 3" in str(exc_info.value)
@@ -1369,10 +1422,14 @@ class TestErrorCodes:
     def test_tool_timeout_is_504(self, monkeypatch):
         import subprocess
 
-        def timeout(*args, **kwargs):
-            raise subprocess.TimeoutExpired(cmd="x", timeout=1)
+        class Proc:
+            pid = 4242
 
-        monkeypatch.setattr(subprocess, "run", timeout)
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: Proc())
+        monkeypatch.setattr(convert, "_kill_process_tree", lambda proc: None)
         with pytest.raises(convert.ConversionError) as exc_info:
             convert._run_tool(["x"], 1.0, "thing")
         assert exc_info.value.code == 504
@@ -1382,9 +1439,12 @@ class TestErrorCodes:
 
         class Proc:
             returncode = 3
-            stdout = b"it broke"
+            pid = 4242
 
-        monkeypatch.setattr(subprocess, "run", lambda *a, **k: Proc())
+            def communicate(self, timeout=None):
+                return b"it broke", None
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: Proc())
         with pytest.raises(convert.ConversionError) as exc_info:
             convert._run_tool(["x"], 1.0, "thing")
         assert exc_info.value.code == 500
@@ -1395,7 +1455,7 @@ class TestErrorCodes:
         def gone(*args, **kwargs):
             raise FileNotFoundError("soffice")
 
-        monkeypatch.setattr(subprocess, "run", gone)
+        monkeypatch.setattr(subprocess, "Popen", gone)
         with pytest.raises(convert.ConversionError) as exc_info:
             convert._run_tool(["soffice"], 1.0, "LibreOffice")
         assert exc_info.value.code == 415
@@ -1444,14 +1504,17 @@ class TestErrorCodes:
 
         class Proc:
             returncode = 0
-            stdout = b""
+            pid = 4242
 
-        def fake_run(cmd, **kwargs):
+            def communicate(self, timeout=None):
+                return b"", None
+
+        def fake_popen(cmd, **kwargs):
             captured["cmd"] = cmd
             captured["kwargs"] = kwargs
             return Proc()
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
         convert._run_tool(["a", "b c"], 1.0, "thing")
         assert captured["cmd"] == ["a", "b c"]
         assert captured["kwargs"].get("shell") in (None, False)

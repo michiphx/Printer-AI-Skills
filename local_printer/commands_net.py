@@ -43,6 +43,8 @@ def discover(
 
 def probe(host: str, timeout: float = 1.0) -> Dict[str, Any]:
     """Check one host: which printing ports answer, and what the device says."""
+    if not discovery.valid_host(host):
+        return APIResponse.error(400, "invalid host").to_dict()
     open_ports = discovery.probe_ports(host, timeout=timeout)
     identity = discovery.ipp_query(host, timeout=max(timeout * 3, 3.0))
     data = {
@@ -239,6 +241,11 @@ def _setup_cups(host: str, name: Optional[str] = None, dry_run: bool = False) ->
     """CUPS equivalent: driverless IPP Everywhere via lpadmin."""
     import shlex
     import subprocess
+
+    # Same check the Windows path applies: a malformed host must fail fast
+    # rather than spending tens of seconds in socket timeouts before a 404.
+    if not discovery.valid_host(host):
+        return APIResponse.error(400, "invalid host").to_dict()
 
     identity = discovery.ipp_query(host, timeout=4.0)
     if not identity:

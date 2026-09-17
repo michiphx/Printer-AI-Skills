@@ -424,8 +424,31 @@ def test_ps_strips_preamble_and_category_info(monkeypatch):
 
 
 def _fake_caps(monkeypatch, caps):
-    """verify_capabilities imports get_capabilities from local_printer.windows."""
+    """verify_capabilities imports get_capabilities from local_printer.windows.
+
+    That module imports win32con/win32print/pywintypes at load time, which do
+    not exist off Windows, so the same fake-module pattern as
+    tests/test_windows_print.py is used: stand-ins go into sys.modules before
+    the import and the fake-backed module is dropped again afterwards.
+    """
+    import importlib
+    import types
+
+    from tests.test_windows_print import FakeDevMode, FakeWin32Print, _WIN32CON
+
+    monkeypatch.setitem(sys.modules, "win32con", _WIN32CON)
+    monkeypatch.setitem(sys.modules, "win32print", FakeWin32Print([], FakeDevMode()))
+    monkeypatch.setitem(
+        sys.modules, "pywintypes",
+        types.SimpleNamespace(error=type("error", (Exception,), {})),
+    )
     import local_printer.windows as win
+
+    win = importlib.reload(win)
+    # Registered through monkeypatch so the fake-backed module is dropped
+    # again on teardown; verify_capabilities re-imports it by name at call
+    # time, so it has to stay in sys.modules for the duration of the test.
+    monkeypatch.setitem(sys.modules, "local_printer.windows", win)
 
     monkeypatch.setattr(win, "get_capabilities", lambda name: caps)
 

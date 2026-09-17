@@ -319,10 +319,58 @@ def epson_lookup(
             "size_mb": round(item["size"] / 1048576, 1) if item.get("size") else None,
         })
     # Full driver packages first, then combo installers, newest version first.
-    result["downloads"].sort(
-        key=lambda d: (d["category"] != "Drivers", str(d.get("version") or "")), reverse=False
-    )
+    result["downloads"].sort(key=_download_sort_key)
     return result
+
+
+def _parse_version(version: Any) -> tuple:
+    """Turn a version string into a sortable tuple of ints.
+
+    "10.01" -> (1, 10, 1), "2.68" -> (1, 2, 68), "3.0" -> (1, 3, 0).
+    Numeric parts are compared as integers so "10.01" ranks above "2.68";
+    a trailing non-numeric suffix ("1.2b") is kept as a string tie-breaker
+    after the numbers. Versions with no leading number ("beta", None) get a
+    leading 0 so they sort behind every parseable version. Never raises.
+    """
+    text = str(version or "").strip()
+    parts: List[int] = []
+    suffix = ""
+    for piece in text.split("."):
+        match = re.match(r"\d+", piece)
+        if match is None:
+            suffix = piece
+            break
+        parts.append(int(match.group()))
+        if match.end() != len(piece):
+            suffix = piece[match.end():]
+            break
+    if not parts:
+        return (0, text)
+    return (1, tuple(parts), suffix)
+
+
+def _download_sort_key(d: Dict[str, Any]) -> tuple:
+    """Sort key: "Drivers" category first, then highest parsed version first.
+
+    Tuples cannot be negated, so the version component is wrapped in `_Desc`
+    to make it sort descending while the category component stays ascending.
+    """
+    return (d.get("category") != "Drivers", _Desc(_parse_version(d.get("version"))))
+
+
+class _Desc:
+    """Wrapper that inverts ordering so a mixed asc/desc sort key works."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any):
+        self.value = value
+
+    def __lt__(self, other: "_Desc") -> bool:
+        return self.value > other.value
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Desc) and self.value == other.value
 
 
 # ------------------------------------------------------------ public API

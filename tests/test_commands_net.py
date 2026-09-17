@@ -398,6 +398,37 @@ def test_setup_cups_host_without_ipp_is_404(monkeypatch):
     assert calls == []
 
 
+@pytest.mark.parametrize("host", ["x; rm", "host&&id", "ipp://printer.local", ""])
+def test_setup_cups_invalid_host_is_400_without_touching_network(monkeypatch, host):
+    # R3-04: the autouse fixture makes ipp_query raise, so reaching it here
+    # would fail the test - the validation must short-circuit before it.
+    monkeypatch.setattr(cn, "IS_WINDOWS", False)
+
+    result = cn.setup(host, dry_run=True)
+
+    assert result["code"] == 400
+    assert result["msg"] == "invalid host"
+
+
+def test_setup_cups_valid_hostname_passes_validation(monkeypatch):
+    calls = []
+    _patch_cups_setup(monkeypatch, identity=_IDENTITY, calls=calls)
+
+    result = cn.setup("printer.local", dry_run=True)
+
+    assert result["code"] == 200
+    assert calls == []
+
+
+@pytest.mark.parametrize("host", ["x; rm", "$(id)", "[fe80::1]"])
+def test_probe_invalid_host_is_400_without_touching_network(host):
+    # probe_ports / ipp_query raise via the autouse fixture if reached.
+    result = cn.probe(host, timeout=0.1)
+
+    assert result["code"] == 400
+    assert result["msg"] == "invalid host"
+
+
 def test_setup_cups_dry_run_reports_command_and_runs_nothing(monkeypatch):
     calls = []
     _patch_cups_setup(monkeypatch, identity=_IDENTITY, calls=calls)

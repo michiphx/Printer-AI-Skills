@@ -779,6 +779,32 @@ def set_dev_mode(devmode, options: WindowsPrintOptions):
     devmode.Fields = devmode.Fields | fields_to_set
 
 
+def _ignored_options(options: Optional[WindowsPrintOptions]) -> List[str]:
+    """Option keys the Windows backend has no DEVMODE mapping for.
+
+    WindowsPrintOptions.from_dict parks anything it cannot translate in
+    extra_options and set_dev_mode never reads it, so without this the caller
+    would get a 200 with default settings and no hint that e.g. a CUPS-style
+    key was dropped. Logged once and returned for the result payload.
+    """
+    if options is None or not options.extra_options:
+        return []
+    ignored = sorted(options.extra_options)
+    logger.warning(
+        "[print_file] ignoring unsupported print options on Windows: "
+        + ", ".join(ignored)
+    )
+    return ignored
+
+
+def _with_ignored_options(data: Dict[str, Any], options: Optional[WindowsPrintOptions]) -> Dict[str, Any]:
+    """Add `ignored_options` to a print result when any option was dropped."""
+    ignored = _ignored_options(options)
+    if ignored:
+        data["ignored_options"] = ignored
+    return data
+
+
 # Formats a printer can be expected to interpret when handed the bytes verbatim.
 # Nothing is blocked on this any more: it is the list of extensions that may
 # fall back to the raw spooler path when the file is not a PDF.
@@ -879,14 +905,17 @@ def _print_raw(printer_name: str, file_path: str,
         win32print.ClosePrinter(handle)
 
     return APIResponse.success(
-        {
-            "printer_name": printer_name,
-            "file_path": file_path,
-            "status": "submitted",
-            "job_id": job_id,
-            "method": "raw",
-            "note": note,
-        }
+        _with_ignored_options(
+            {
+                "printer_name": printer_name,
+                "file_path": file_path,
+                "status": "submitted",
+                "job_id": job_id,
+                "method": "raw",
+                "note": note,
+            },
+            options,
+        )
     ).to_dict()
 
 
@@ -1073,23 +1102,26 @@ def _print_pdf_gdi(printer_name: str, port: str, file_path: str,
             pass
 
     return APIResponse.success(
-        {
-            "printer_name": printer_name,
-            "file_path": file_path,
-            "status": "submitted",
-            "job_id": job_id,
-            "method": "gdi",
-            "pages": page_count,
-            "sheets_drawn": len(order),
-            "dpi": dpi,
-            "copies": requested_copies,
-            "copies_handled_by": copies_handled_by,
-            "collate": collate,
-            "auto_landscape": landscape,
-            "printable_area": [printable_w, printable_h],
-            "physical_page": [physical_w, physical_h],
-            "physical_offset": [offset_x, offset_y],
-        }
+        _with_ignored_options(
+            {
+                "printer_name": printer_name,
+                "file_path": file_path,
+                "status": "submitted",
+                "job_id": job_id,
+                "method": "gdi",
+                "pages": page_count,
+                "sheets_drawn": len(order),
+                "dpi": dpi,
+                "copies": requested_copies,
+                "copies_handled_by": copies_handled_by,
+                "collate": collate,
+                "auto_landscape": landscape,
+                "printable_area": [printable_w, printable_h],
+                "physical_page": [physical_w, physical_h],
+                "physical_offset": [offset_x, offset_y],
+            },
+            options,
+        )
     ).to_dict()
 
 

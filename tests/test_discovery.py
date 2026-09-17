@@ -438,6 +438,80 @@ class TestResolveHost:
     def test_resolve_timeout_default_is_bounded(self):
         assert 0 < discovery.DEFAULT_RESOLVE_TIMEOUT <= 5.0
 
+    def test_hung_resolver_does_not_hold_up_process_exit(self):
+        # R3-03: the old ThreadPoolExecutor version returned on time, but
+        # concurrent.futures joins its workers at interpreter exit, so the
+        # whole CLI process hung until getaddrinfo actually came back.  Run
+        # the resolver in a real subprocess with a getaddrinfo that sleeps
+        # well past the timeout and check the process itself exits promptly.
+        import subprocess
+
+        repo_root = Path(__file__).resolve().parent.parent
+        script = "\n".join([
+            "import socket, sys, time",
+            "from local_printer import discovery",
+            "def slow_gai(*a, **k):",
+            "    time.sleep(8.0)",
+            "    return [(socket.AF_INET, 1, 6, '', ('192.168.1.72', 0))]",
+            "socket.getaddrinfo = slow_gai",
+            "t0 = time.monotonic()",
+            "result = discovery._resolve_hostname('ghost.local', timeout=0.5)",
+            "print(repr(result), round(time.monotonic() - t0, 3))",
+        ])
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=3.0,  # raises TimeoutExpired if exit is blocked by the worker
+        )
+        wall = time.monotonic() - started
+        assert proc.returncode == 0, proc.stderr
+        value, elapsed = proc.stdout.split()
+        assert value == "None"
+        assert float(elapsed) < 2.0, f"_resolve_hostname blocked for {elapsed}s"
+        assert wall < 3.0, f"subprocess took {wall:.2f}s to exit"
+
+
+# --------------------------------------------------------------- valid_host
+
+
+class TestValidHost:
+    @pytest.mark.parametrize("host", [
+        "192.168.1.72",
+        "10.0.0.5",
+        "fe80::1",
+        "fe80::1%eth0",
+        "2001:db8::42",
+        "printer.local",
+        "EPSON-ET-4850",
+        "my-printer.example.com",
+        "a",
+    ])
+    def test_accepts_ip_literals_and_hostnames(self, host):
+        assert discovery.valid_host(host) is True
+
+    @pytest.mark.parametrize("host", [
+        "",
+        None,
+        42,
+        "x; rm",
+        "x rm",
+        "host&&id",
+        "$(id)",
+        "`id`",
+        "host|cat",
+        "ipp://printer.local",
+        "printer.local/ipp/print",
+        "[fe80::1]",
+        "printer_local",
+        "a" * 254,
+        "999.999.999.999;x",
+    ])
+    def test_rejects_malformed_input(self, host):
+        assert discovery.valid_host(host) is False
+
     def test_percent_encoded_ipv6_zone_is_literal(self, monkeypatch):
         # RFC 6874 writes a zone index as %25 inside the URI; the decoded form
         # is a valid IPv6 literal and must not go anywhere near the resolver.
