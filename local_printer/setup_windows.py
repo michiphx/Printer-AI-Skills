@@ -510,8 +510,13 @@ def verify_capabilities(printer_name: str, identity: Optional[Dict[str, Any]]) -
                 f"media types ({queue['media_types']} exposed, {device_media} on device)"
             )
         device_sources = len(identity.get("media_sources", []))
-        if device_sources > queue["trays"] and queue["trays"] == 0:
-            missing.append("paper trays (none exposed)")
+        if device_sources > queue["trays"]:
+            missing.append(
+                f"paper trays ({queue['trays']} exposed, {device_sources} on device)"
+            )
+        device_color_modes = identity.get("color_modes") or []
+        if len(device_color_modes) > 1 and not queue["color"]:
+            missing.append("color (device supports color printing)")
 
     return {
         "printer": printer_name,
@@ -538,11 +543,19 @@ def verify_capabilities(printer_name: str, identity: Optional[Dict[str, Any]]) -
 
 
 def _pairing_regex(model: str, host: str) -> str:
-    """A short, distinctive -Match value for win-pair-printer.ps1."""
+    """A short, distinctive -Match value for win-pair-printer.ps1.
+
+    This is advisory text only (never executed by this codebase - it's
+    surfaced to the user as a recommended command line), but falling back to
+    a bare `host` when nothing better is available must still be
+    `re.escape`d: an unescaped dotted IP like 192.168.1.5 has its dots act as
+    regex wildcards in the suggested -Match value, which could match
+    unintended printer names.
+    """
     strong = _strong_tokens(model)
     numeric = [t for t in strong if any(ch.isdigit() for ch in t)]
     token = (numeric or strong or [""])[0]
-    return token or model or host
+    return token or model or re.escape(host)
 
 
 def plan_setup(

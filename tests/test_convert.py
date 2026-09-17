@@ -17,6 +17,7 @@ import os
 import shutil
 import sys
 import types
+from unittest import mock
 
 import pytest
 
@@ -418,6 +419,28 @@ class TestTextConversion:
             for note in result.notes
         ), result.notes
 
+    def test_cjk_check_skipped_when_fonttools_unavailable(self, monkeypatch):
+        """R6: when fontTools cannot be imported at all, _font_cmap must
+        return the distinct _FONTTOOLS_UNAVAILABLE sentinel (not None), and
+        _cjk_coverage_note must then skip the check entirely (no note) -
+        NOT fall back to treating every CJK document as uncovered. See
+        _cjk_coverage_note's docstring for why that would be worse (a
+        false-positive warning on every CJK document degrades trust more
+        than occasionally missing a real gap)."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "fontTools.ttLib":
+                raise ImportError("simulated: fontTools not installed")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        assert convert._font_cmap("/some/font.ttf") is convert._FONTTOOLS_UNAVAILABLE
+        assert convert._cjk_coverage_note("中文测试", "/some/font.ttf") is None
+
 
 # ==================== live: image -> PDF ====================
 
@@ -531,6 +554,27 @@ class TestImageConversion:
         Image.new("RGB", (100, 100), (0, 0, 0)).save(path)
         result = convert.to_pdf(str(path), out_dir=str(tmp_path / "out"))
         assert "Letter" in " ".join(result.notes)
+
+    def test_install_hint_names_reportlab_when_that_is_missing(self):
+        """R6/Doc-5: `available()` correctly reports reportlab as the missing
+        dependency when Pillow is present, but `install_hint` used to be
+        hardcoded to the Pillow-specific hint regardless - actively
+        misleading. It must now name whichever dependency is actually
+        missing."""
+        conv = convert.ImageConverter()
+        with mock.patch.object(
+            conv, "available", return_value=(False, "reportlab is not installed")
+        ):
+            assert "reportlab" in conv.install_hint
+            assert "Pillow" not in conv.install_hint
+
+    def test_install_hint_names_pillow_when_that_is_missing(self):
+        conv = convert.ImageConverter()
+        with mock.patch.object(
+            conv, "available", return_value=(False, "Pillow is not installed")
+        ):
+            assert "Pillow" in conv.install_hint
+            assert "reportlab" not in conv.install_hint
 
 
 # ==================== live: markdown ====================

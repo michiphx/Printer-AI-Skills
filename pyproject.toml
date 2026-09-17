@@ -12,6 +12,7 @@ dependencies = [
     "Pillow>=10.0",        # images -> PDF; also the DIB bridge for GDI printing on Windows
     "reportlab>=4.0",      # plain text / code -> PDF (pure Python)
     "markdown>=3.5",       # Markdown -> HTML (then HTML -> PDF via a browser or LibreOffice)
+    "fonttools>=4.0",      # CJK glyph-coverage check (see convert.py's _font_cmap)
     # Driver-based printing on Windows: rasterise PDF pages and hand them to the printer driver
     "pypdfium2>=4.0; sys_platform == 'win32'",
 ]

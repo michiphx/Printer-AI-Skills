@@ -143,9 +143,12 @@ printer-ai formats --json   # converter, extensions, available, via, install_hin
   Use it to preview or debug what will actually be printed (open the PDF, check
   the page count) before committing paper, or when the user just wants a PDF.
   Without `--out` the PDF lands next to the source file; an `--out` ending in
-  `.pdf` names the file, anything else is treated as a directory.
+  `.pdf` names the file, anything else is treated as a directory. It refuses to
+  overwrite an existing output file with code `409` unless `--overwrite` is
+  passed.
 - `--keep-pdf` — print *and* keep the converted PDF; its location comes back in
-  `data.pdf_path`. Use it when the user wants the PDF too.
+  `data.pdf_path`. Use it when the user wants the PDF too. Kept PDFs live under
+  `~/.cache/printer-ai/kept/` and are auto-pruned after 7 days.
 - `--raw` — skip conversion entirely and push the bytes at the device (CUPS
   `-o raw`, Windows RAW spool). **Only** for printer-native streams: a `.prn`
   spool file, PostScript or PCL aimed at a device that speaks it. Never reach
@@ -359,6 +362,13 @@ printer-ai setup 192.168.1.72 --no-generic       # fail rather than degrade
 printer-ai setup 192.168.1.72 --vendor-lookup    # opt-in: ask the vendor site
 ```
 
+`setup`'s behaviour is **completely different on Windows vs. macOS/Linux** —
+this codebase drives Windows through `setup_windows.py`'s driver/port APIs, and
+everything else through plain `lpadmin` (CUPS). Read whichever half applies to
+the machine you're actually on.
+
+#### Windows
+
 Identifies the device over IPP, then walks a strategy ladder from best to worst:
 
 1. **Vendor driver** — installed, or pulled from the in-box Windows INF store
@@ -398,6 +408,33 @@ manufacturer's site and sends the printer model, your OS version and your
 region. `setup` does **not** do this unless you pass the flag. Use it only when
 no usable driver was found locally and the user has agreed to a vendor lookup;
 otherwise leave it off and work from what is installed in-box.
+
+#### macOS / Linux (CUPS)
+
+Much simpler than the Windows ladder — there's no vendor-driver search, no INF
+store, and no separate "IPP Everywhere" step to skip, so none of the
+Windows-11-specific gating above applies here. `setup` runs a 2-step fallback
+straight through `lpadmin`:
+
+1. **Driverless (`lpadmin -m everywhere`)** — queries the device over IPP; if
+   it answers, installs an `everywhere`-driver queue at
+   `ipp://HOST/...` that negotiates duplex/media/colour live from the device,
+   the same as Windows's IPP Everywhere step but needing no admin/elevation —
+   the relevant permission model on Linux/macOS is simply being in the
+   `lpadmin` group (or root), not an elevated shell.
+2. **Raw 9100 fallback** — if the device doesn't answer IPP at all (checked by
+   probing port 9100), installs a plain `socket://HOST:9100` queue instead.
+   The response carries `"raw_fallback": true` and an `"installed_with":
+   {"kind": "raw-fallback", "driver": "raw"}`, plus a `note` explaining that no
+   driverless capability negotiation happened — just a plain print stream, same
+   caveat as Windows's raw-9100 last resort.
+
+There is no `--no-generic` equivalent and no capability-downgrade report on
+this path (both are Windows-only, `setup_windows.py`-side features) — CUPS
+`setup` either finds a driverless IPP printer or falls back to raw, and reports
+which one it used via `identity` (`None` on the raw path) and `raw_fallback`.
+`--dry-run` returns the `lpadmin` command it would run (`would_run`) without
+executing it, on either step.
 
 ### Windows 11: installing a network printer that actually works
 

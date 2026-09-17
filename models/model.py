@@ -87,36 +87,36 @@ class APIResponse:
         return asdict(self)
 
     @classmethod
-    def success(cls, data: Dict[str, Any] = None) -> "APIResponse":
+    def success(cls, data: Optional[Dict[str, Any]] = None) -> "APIResponse":
         """Create success response"""
         return cls(code=200, msg="success", data=data or {})
 
     @classmethod
-    def error(cls, code: int, msg: str, data: Dict[str, Any] = None) -> "APIResponse":
+    def error(cls, code: int, msg: str, data: Optional[Dict[str, Any]] = None) -> "APIResponse":
         """Create error response"""
         return cls(code=code, msg=msg, data=data or {})
 
     @classmethod
     def not_found(
-        cls, msg: str = "Resource not found", data: Dict[str, Any] = None
+        cls, msg: str = "Resource not found", data: Optional[Dict[str, Any]] = None
     ) -> "APIResponse":
         """Create not found response"""
         return cls(code=404, msg=msg, data=data or {})
 
     @classmethod
-    def server_error(cls, msg: str, data: Dict[str, Any] = None) -> "APIResponse":
+    def server_error(cls, msg: str, data: Optional[Dict[str, Any]] = None) -> "APIResponse":
         """Create server error response"""
         return cls(code=500, msg=msg, data=data or {})
 
     @classmethod
     def unsupported_media_type(
-        cls, msg: str, data: Dict[str, Any] = None
+        cls, msg: str, data: Optional[Dict[str, Any]] = None
     ) -> "APIResponse":
         """Create a 415 response: the file format cannot be handled"""
         return cls(code=415, msg=msg, data=data or {})
 
     @classmethod
-    def not_implemented(cls, msg: str, data: Dict[str, Any] = None) -> "APIResponse":
+    def not_implemented(cls, msg: str, data: Optional[Dict[str, Any]] = None) -> "APIResponse":
         """Create a 501 response: this platform/backend cannot do it"""
         return cls(code=501, msg=msg, data=data or {})
 

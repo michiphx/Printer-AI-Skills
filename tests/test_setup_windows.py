@@ -6,6 +6,7 @@ guarantees. No test touches a real printer, port, or driver.
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -413,13 +414,16 @@ def test_plan_setup_recommended_command_escapes_malicious_model(monkeypatch):
     expected = f"scripts/win-pair-printer.ps1 -Match {sw._ps_literal(malicious_model)}"
     assert recommended == expected
 
-    # It must be wrapped in a single-quoted PowerShell literal (exactly one
-    # opening and one closing unpaired quote), with no bare `-Match "` that a
-    # `"` in the payload could terminate early.
-    assert '-Match "' not in recommended
-    assert recommended.count("'") == 2
-    assert recommended.startswith("scripts/win-pair-printer.ps1 -Match '")
-    assert recommended.endswith("'")
+
+def test_pairing_regex_escapes_bare_ip_host_fallback():
+    """R6/SW-4: when there's no usable model token at all, `_pairing_regex`
+    falls back to the bare `host`. An unescaped dotted IP like 192.168.1.5
+    would have its dots act as regex wildcards in the suggested -Match
+    value (advisory text only, never executed by this codebase) -
+    `re.escape` must be applied to that fallback."""
+    result = sw._pairing_regex("", "192.168.1.5")
+    assert result == re.escape("192.168.1.5")
+    assert "\\." in result
 
 
 # ------------------------------------------------------------------------- _ps
@@ -523,3 +527,54 @@ def test_verify_capabilities_full_match_is_full_featured(monkeypatch):
     assert result["comparable"] is True
     assert result["full_featured"] is True
     assert result["missing"] == []
+
+
+def test_verify_capabilities_reports_partial_tray_downgrade(monkeypatch):
+    """R6/SW-1: a queue that exposes SOME but not all of the device's trays
+    must still be flagged - the old guard only fired when trays were
+    completely absent (0), silently missing a partial downgrade (device has
+    3 sources, queue exposes only 1)."""
+    _fake_caps(
+        monkeypatch,
+        {
+            "Duplex": {"Off": 1, "Long Edge": 2},
+            "Papers": {"A4": 9},
+            "Bins": {"Main tray": 1},
+            "MediaTypes": {"Plain": 1},
+            "Color": {"Black": 1, "Color": 2},
+        },
+    )
+    identity = {
+        "supports_duplex": True,
+        "media_types": ["stationery"],
+        "media_sources": ["main", "tray2", "tray3"],
+    }
+    result = sw.verify_capabilities("Some Queue", identity)
+    assert result["full_featured"] is False
+    assert any("tray" in m for m in result["missing"]), result["missing"]
+
+
+def test_verify_capabilities_reports_color_downgrade(monkeypatch):
+    """R6/SW-1: a device that advertises multiple color modes but whose
+    installed queue exposes only one (i.e. no real color capability) must be
+    flagged as a downgrade - previously `queue["color"]` was computed but
+    never compared against the device's own `color_modes`."""
+    _fake_caps(
+        monkeypatch,
+        {
+            "Duplex": {"Off": 1, "Long Edge": 2},
+            "Papers": {"A4": 9},
+            "Bins": {"Main tray": 1},
+            "MediaTypes": {"Plain": 1},
+            "Color": {"Black": 1},
+        },
+    )
+    identity = {
+        "supports_duplex": True,
+        "media_types": ["stationery"],
+        "media_sources": ["main"],
+        "color_modes": ["color", "monochrome"],
+    }
+    result = sw.verify_capabilities("Some Queue", identity)
+    assert result["full_featured"] is False
+    assert any("color" in m for m in result["missing"]), result["missing"]

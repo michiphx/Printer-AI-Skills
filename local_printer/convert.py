@@ -945,7 +945,23 @@ class ImageConverter(BaseConverter):
     name = "image"
     kinds = (KIND_IMAGE,)
     extensions = tuple(sorted(IMAGE_EXTENSIONS))
-    install_hint = PILLOW_HINT
+
+    @property
+    def install_hint(self) -> str:
+        """Whichever of Pillow/reportlab `available()` actually found missing.
+
+        Previously this was hardcoded to `PILLOW_HINT`, which was actively
+        misleading on a machine that has Pillow but not reportlab: the
+        `detail` from `available()` correctly said "reportlab is not
+        installed" while `install_hint` next to it kept pointing at Pillow.
+        """
+        ok, detail = self.available()
+        if not ok:
+            if "reportlab" in detail:
+                return REPORTLAB_HINT
+            if "Pillow" in detail:
+                return PILLOW_HINT
+        return f"{PILLOW_HINT}; {REPORTLAB_HINT}"
 
     #: Cap on frames placed from an animated GIF/WebP/APNG. Without a cap, a
     #: many-thousand-frame animation becomes a many-thousand-page PDF - a
@@ -1202,18 +1218,31 @@ def _cjk_codepoints(text: str) -> set:
     }
 
 
-def _font_cmap(font_path: Optional[str]) -> Optional[Dict[int, str]]:
+#: Sentinel returned by :func:`_font_cmap` specifically when ``fontTools``
+#: itself cannot be imported, as opposed to a font file that fails to parse.
+#: Kept distinct from ``None`` so :func:`_cjk_coverage_note` can tell "we
+#: genuinely don't know" (fontTools missing) apart from "no path / unreadable
+#: font" (still treated as uncovered) - see that function's docstring.
+_FONTTOOLS_UNAVAILABLE = object()
+
+
+def _font_cmap(font_path: Optional[str]):
     """Best-effort {codepoint: glyph name} map for ``font_path``.
 
-    None when it cannot be determined at all (no path - i.e. the Courier
-    fallback - fontTools missing, or the file cannot be parsed); callers
-    must then assume the worst rather than silently skip the warning.
+    Returns ``None`` when no path was given (the Courier fallback) or the
+    font file could not be parsed - callers then assume the worst. Returns
+    :data:`_FONTTOOLS_UNAVAILABLE` specifically when the ``fontTools``
+    package itself cannot be imported, so callers can treat that case
+    differently (see :func:`_cjk_coverage_note`).
     """
     if not font_path:
         return None
     try:
         from fontTools.ttLib import TTFont as FontToolsTTFont
-
+    except ImportError as exc:
+        logger.debug("fontTools not installed - cannot verify CJK glyph coverage: %s", exc)
+        return _FONTTOOLS_UNAVAILABLE
+    try:
         return FontToolsTTFont(font_path, fontNumber=0).getBestCmap()
     except Exception as exc:
         logger.debug("could not read glyph coverage for %s: %s", font_path, exc)
@@ -1234,11 +1263,22 @@ def _cjk_coverage_note(text: str, font_path: Optional[str]) -> Optional[str]:
     `.notdef` tofu boxes. The scan runs once per document, not per
     character/render call, and never fails the conversion - it only adds an
     informational note.
+
+    Deliberate choice on a machine without ``fontTools`` installed: rather
+    than defaulting to "assume uncovered" (which would fire this warning on
+    *every* CJK document, including ones that would render fine, since we
+    have no way to check), the check is skipped entirely and no note is
+    added. A false-positive warning on every CJK document would degrade
+    trust in this feature more than occasionally missing a real gap. Install
+    ``fontTools`` (a declared dependency of this project) to get accurate
+    per-character coverage checking.
     """
     codepoints = _cjk_codepoints(text)
     if not codepoints:
         return None
     cmap = _font_cmap(font_path)
+    if cmap is _FONTTOOLS_UNAVAILABLE:
+        return None
     uncovered = True if cmap is None else any(cp not in cmap for cp in codepoints)
     if not uncovered:
         return None

@@ -197,8 +197,8 @@ and agents can branch on the exit status alone.
 | `printers [--json]` | List all printers |
 | `status [INDEX] [--json]` | Get printer status (spooler view) |
 | `attrs [INDEX]` | Get printer capabilities as exposed by the driver |
-| `print FILE [--index N] [--options JSON] [--raw] [--keep-pdf]` | Print a file (converted to PDF first; `--raw` sends the bytes untouched, `--keep-pdf` keeps the converted PDF and reports `pdf_path`) |
-| `convert FILE [--out PATH_OR_DIR] [--json]` | Convert to PDF only, do not print (default: next to the source file; an `--out` ending in `.pdf` names the file, anything else is a directory) |
+| `print FILE [--index N] [--options JSON] [--raw] [--keep-pdf]` | Print a file (converted to PDF first; `--raw` sends the bytes untouched, `--keep-pdf` keeps the converted PDF and reports `pdf_path` — kept PDFs live under `~/.cache/printer-ai/kept/` and are auto-pruned after 7 days) |
+| `convert FILE [--out PATH_OR_DIR] [--overwrite] [--json]` | Convert to PDF only, do not print (default: next to the source file; an `--out` ending in `.pdf` names the file, anything else is a directory; refuses to overwrite an existing output file with code `409` unless `--overwrite` is passed) |
 | `formats [--json]` | Which file types can be printed here: per-converter extensions, `available`, `via`, `install_hint` for the missing ones, and the effective `page_size`. Always exits `0` |
 | `jobs [--printer NAME] [--json]` | List print jobs |
 | `job-status JOB_ID` | Get job status |
