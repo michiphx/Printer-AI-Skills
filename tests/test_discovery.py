@@ -488,6 +488,8 @@ class TestValidHost:
         "EPSON-ET-4850",
         "my-printer.example.com",
         "a",
+        "office_printer.local",
+        "printer_local",
     ])
     def test_accepts_ip_literals_and_hostnames(self, host):
         assert discovery.valid_host(host) is True
@@ -505,7 +507,6 @@ class TestValidHost:
         "ipp://printer.local",
         "printer.local/ipp/print",
         "[fe80::1]",
-        "printer_local",
         "a" * 254,
         "999.999.999.999;x",
     ])

@@ -297,7 +297,11 @@ class TestCmdPrint:
 
         assert fake_backend.calls[0]["file_path"] == str(source)
 
-    def test_keep_pdf_reports_and_keeps_the_file(self, fake_backend, tmp_path, capsys):
+    def test_keep_pdf_reports_and_keeps_the_file(
+        self, fake_backend, tmp_path, capsys, monkeypatch
+    ):
+        # Isolate ~/.cache/printer-ai/kept under tmp_path for this test.
+        monkeypatch.setenv("HOME", str(tmp_path))
         source = tmp_path / "notes.txt"
         source.write_text("hello\n")
 
@@ -305,8 +309,41 @@ class TestCmdPrint:
 
         out = capsys.readouterr().out
         assert "pdf kept at:" in out
-        kept = fake_backend.calls[0]["file_path"]
-        assert os.path.isfile(kept)
+
+        # The backend was handed the file while it still lived in the
+        # ephemeral temp directory to_pdf() created...
+        ephemeral_path = fake_backend.calls[0]["file_path"]
+        ephemeral_dir = os.path.dirname(ephemeral_path)
+        assert os.path.basename(ephemeral_dir).startswith("printer-ai-")
+
+        # ...but by the time cmd_print is done, the PDF has been relocated
+        # to the stable, documented ~/.cache/printer-ai/kept location...
+        kept_dir = os.path.expanduser("~/.cache/printer-ai/kept")
+        assert os.path.isdir(kept_dir)
+        kept_files = os.listdir(kept_dir)
+        assert len(kept_files) == 1
+        kept_path = os.path.join(kept_dir, kept_files[0])
+        assert os.path.isfile(kept_path)
+        assert kept_files[0].startswith("notes-")
+
+        # ...and the ephemeral temp directory to_pdf() made no longer exists,
+        # so it can never leak on disk.
+        assert not os.path.exists(ephemeral_dir)
+
+    def test_keep_pdf_reports_the_stable_path_in_result_data(
+        self, fake_backend, tmp_path, capsys, monkeypatch
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        source = tmp_path / "notes.txt"
+        source.write_text("hello\n")
+
+        run_cli(["print", str(source), "--keep-pdf", "--json"])
+
+        result = json.loads(capsys.readouterr().out)
+        pdf_path = result["data"]["pdf_path"]
+        kept_dir = os.path.expanduser("~/.cache/printer-ai/kept")
+        assert os.path.dirname(pdf_path) == kept_dir
+        assert os.path.isfile(pdf_path)
 
     def test_unconvertible_file_is_415_with_a_hint(self, fake_backend, tmp_path, capsys):
         source = tmp_path / "blob.bin"

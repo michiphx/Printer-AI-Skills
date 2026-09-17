@@ -311,6 +311,8 @@ class TestWindowsPrintOptions:
             ("copies", "lots"),
             ("copies", 0),
             ("copies", True),
+            ("copies", 999999999),
+            ("copies", 1000),
             ("print-color-mode", False),
         ],
     )
@@ -342,3 +344,16 @@ class TestWindowsPrintOptions:
         original = dict(data)
         WindowsPrintOptions.from_dict(data)
         assert data == original
+
+    def test_copies_at_max_is_translated(self):
+        opts = WindowsPrintOptions.from_dict({"copies": WindowsPrintOptions.MAX_COPIES})
+        assert opts.dmCopies == WindowsPrintOptions.MAX_COPIES
+        assert opts.extra_options is None
+
+    def test_absurd_copies_is_reported_not_clamped(self):
+        """A caller asking for 999999999 copies almost certainly made a
+        mistake and should see it surface in extra_options/ignored_options,
+        not silently get clamped to some surprising copy count."""
+        opts = WindowsPrintOptions.from_dict({"copies": 999999999})
+        assert opts.dmCopies is None
+        assert opts.extra_options == {"copies": 999999999}

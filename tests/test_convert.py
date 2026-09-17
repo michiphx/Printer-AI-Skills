@@ -84,6 +84,24 @@ def no_browser(monkeypatch):
     monkeypatch.setattr(convert, "find_browser", lambda: None)
 
 
+@pytest.fixture(autouse=True)
+def isolated_monospace_font_cache(monkeypatch):
+    """Reset the process-wide "which TTF did we register" cache per test, so
+    one test's outcome (font found vs. not found) cannot leak into another."""
+    monkeypatch.setattr(convert, "_monospace_font_cache", convert._MONOSPACE_FONT_UNSET)
+
+
+@pytest.fixture(autouse=True)
+def isolated_browser_status_cache(tmp_path, monkeypatch):
+    """Keep the persistent "is the browser broken" cache out of the real
+    machine state and out of other tests: each test gets an empty in-process
+    cache and its own throwaway cache file."""
+    monkeypatch.setattr(convert, "_browser_status_cache", {})
+    monkeypatch.setattr(
+        convert, "BROWSER_STATUS_CACHE_PATH", str(tmp_path / "browser-status.json")
+    )
+
+
 # ==================== format detection ====================
 
 
@@ -286,6 +304,86 @@ class TestTextConversion:
         result = convert.to_pdf(str(source), out_dir=str(tmp_path / "out"))
         assert result.pdf_path.endswith("README.pdf")
 
+    def test_non_latin1_text_uses_a_real_font_or_notes_the_limitation(self, tmp_path):
+        """Base-14 Courier has no glyphs outside Latin-1, so Cyrillic/CJK
+        content silently rendered as `.notdef` boxes. Whichever branch this
+        sandbox takes is fine - either a suitable TrueType font was found and
+        actually used (visible in the PDF as an embedded non-base-14 font),
+        or none was found and the limitation is called out in the notes."""
+        source = write(tmp_path / "intl.txt", "Привет 日本語\nhello\n")
+        result = convert.to_pdf(source, out_dir=str(tmp_path / "out"))
+        assert is_pdf(result.pdf_path)
+
+        with open(result.pdf_path, "rb") as handle:
+            pdf_bytes = handle.read()
+        embeds_truetype = any(
+            marker in pdf_bytes
+            for marker in (b"/FontFile2", b"/Type0", b"/Identity-H")
+        )
+        font_name = convert.registered_monospace_font()
+        if font_name is not None:
+            assert embeds_truetype, (
+                f"a monospace TTF ({font_name}) was registered but the PDF "
+                "does not appear to embed a non-base-14 font"
+            )
+        else:
+            assert any(
+                "non-latin-1" in note.lower() or "courier" in note.lower()
+                for note in result.notes
+            )
+
+    def test_registered_monospace_font_used_for_wrap_width_and_drawing(self, tmp_path, monkeypatch):
+        """The same font must drive both the column-wrap width calculation
+        and the actual setFont/drawString calls, so wrapping stays honest
+        about what will be drawn."""
+        monkeypatch.setattr(convert, "registered_monospace_font", lambda: None)
+        source = write(tmp_path / "plain.txt", "hello world\n")
+        result = convert.to_pdf(source, out_dir=str(tmp_path / "out"))
+        assert is_pdf(result.pdf_path)
+        assert any("courier" in note.lower() for note in result.notes)
+
+    def test_registered_monospace_font_is_cached_across_calls(self, tmp_path, monkeypatch):
+        """Registering the same TTF twice raises in reportlab, so the lookup
+        and registration must only happen once per process."""
+        calls = []
+        real_candidates = convert._monospace_ttf_candidates
+
+        def counting_candidates():
+            calls.append(1)
+            return real_candidates()
+
+        monkeypatch.setattr(convert, "_monospace_ttf_candidates", counting_candidates)
+        first = convert.registered_monospace_font()
+        second = convert.registered_monospace_font()
+        assert first == second
+        assert len(calls) == 1
+
+    def test_unusable_candidate_falls_through_to_the_next_one(self, tmp_path, monkeypatch):
+        """A candidate that exists but reportlab cannot load (e.g. some
+        variable-font .ttc) must not abandon the search - the next candidate
+        should still be tried."""
+        # A real, loadable (non-.ttc) TTF this test can prove was actually
+        # used, tried after a candidate that "exists" but cannot register.
+        real_path = None
+        for candidate in convert._monospace_ttf_candidates():
+            if os.path.isfile(candidate) and not candidate.lower().endswith(".ttc"):
+                real_path = candidate
+                break
+        if real_path is None:
+            pytest.skip("no usable non-.ttc monospace TTF found on this machine")
+        monkeypatch.setattr(
+            convert, "_monospace_ttf_candidates",
+            lambda: ("/nonexistent/broken.ttc", real_path),
+        )
+        # Make the first (nonexistent) path "exist" so it's actually attempted.
+        real_isfile = os.path.isfile
+        monkeypatch.setattr(
+            os.path, "isfile",
+            lambda p: True if p == "/nonexistent/broken.ttc" else real_isfile(p),
+        )
+        font_name = convert.registered_monospace_font()
+        assert font_name == convert.REGISTERED_MONOSPACE_FONT_NAME
+
 
 # ==================== live: image -> PDF ====================
 
@@ -353,6 +451,37 @@ class TestImageConversion:
         result = convert.to_pdf(str(path), out_dir=str(tmp_path / "out"))
         assert "2 image frame(s)" in " ".join(result.notes)
 
+    def test_animated_gif_frame_count_is_capped(self, tmp_path):
+        """A many-thousand-frame animated GIF must not become a
+        many-thousand-page PDF: only the first MAX_IMAGE_FRAMES are placed,
+        and a note says frames were dropped."""
+        from PIL import Image
+
+        cap = convert.ImageConverter.MAX_IMAGE_FRAMES
+        extra = 10
+        path = tmp_path / "huge_anim.gif"
+        frames = [
+            Image.new("RGB", (20, 20), (i % 256, 0, 0)).convert("P")
+            for i in range(cap + extra)
+        ]
+        frames[0].save(path, save_all=True, append_images=frames[1:])
+
+        result = convert.to_pdf(str(path), out_dir=str(tmp_path / "out"))
+        assert is_pdf(result.pdf_path)
+        assert f"{cap} image frame(s)" in " ".join(result.notes)
+        assert any(
+            "dropped" in note.lower() or "only the first" in note.lower()
+            for note in result.notes
+        )
+
+        # Count the actual pages produced, not just trust the note text.
+        import re
+
+        with open(result.pdf_path, "rb") as handle:
+            pdf_bytes = handle.read()
+        page_objects = re.findall(rb"/Type\s*/Page(?!s)", pdf_bytes)
+        assert len(page_objects) == cap
+
     def test_broken_image_raises_with_hint(self, tmp_path):
         path = tmp_path / "broken.png"
         path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"garbage" * 4)
@@ -408,6 +537,36 @@ class TestMarkdown:
         result = convert.to_pdf(source, out_dir=str(tmp_path / "out"))
         assert result.converter == "markdown"
         assert is_pdf(result.pdf_path)
+
+    @needs_markdown
+    def test_relative_image_reference_resolves_via_base_href(self, tmp_path):
+        """Markdown is rendered into a scratch directory different from the
+        source file's own directory, so a relative image reference
+        (`![x](img/pic.png)`) must resolve against the SOURCE file's
+        directory, not the scratch directory. A <base href> pointing at the
+        source directory achieves that without writing anything into the
+        user's own folder."""
+        docs = tmp_path / "docs"
+        (docs / "img").mkdir(parents=True)
+        (docs / "img" / "pic.png").write_bytes(b"not a real png, just a marker")
+        source = write(docs / "note.md", "# Title\n\n![x](img/pic.png)\n")
+
+        html = convert.MarkdownConverter().to_html(str(source))
+        assert "<base href=" in html
+        # The base must point at the docs/ directory (with a trailing slash
+        # so relative paths resolve *inside* it, not next to it), as a
+        # file:// URL.
+        expected_dir = convert._file_url(str(docs)) + "/"
+        assert expected_dir in html
+        assert 'src="img/pic.png"' in html
+
+    @needs_markdown
+    def test_page_css_matches_configured_page_size(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PRINTER_AI_PAGE_SIZE", "Letter")
+        source = write(tmp_path / "doc.md", "# Title\n\nbody\n")
+        html = convert.MarkdownConverter().to_html(source)
+        width, height = convert.PAGE_SIZES["LETTER"]
+        assert f"@page {{ size: {width:.3f}pt {height:.3f}pt; }}" in html
 
     def test_missing_markdown_package_raises(self, tmp_path, monkeypatch):
         source = write(tmp_path / "doc.md", "# Title\n")
@@ -644,6 +803,98 @@ class TestBrowserDiscovery:
         assert calls == [source]
         assert is_pdf(produced)
         assert any("LibreOffice" in note for note in notes)
+
+    def test_broken_browser_is_cached_and_skipped_on_next_call(self, tmp_path, monkeypatch):
+        """Confirmed live: converting through a browser that cannot render
+        headlessly here pays the full ~60s TIMEOUT on every single call. The
+        fix caches "this browser is broken" so a second conversion in the
+        same process (or, via the persistent file, a later invocation) skips
+        the browser call entirely."""
+        monkeypatch.setattr(convert, "find_browser", lambda: "/usr/bin/chromium")
+        monkeypatch.setattr(convert, "find_soffice", lambda: "/usr/bin/soffice")
+
+        run_calls = []
+
+        def boom(cmd, timeout, what):
+            run_calls.append(cmd)
+            raise convert.ConversionError("browser exploded")
+
+        monkeypatch.setattr(convert, "_run_tool", boom)
+
+        lo_calls = []
+
+        def fake_lo(self, source, out_dir, notes):
+            lo_calls.append(source)
+            target = os.path.join(out_dir, "page.pdf")
+            with open(target, "wb") as handle:
+                handle.write(b"%PDF-1.4\n")
+            return target
+
+        monkeypatch.setattr(convert.OfficeConverter, "convert_with_libreoffice", fake_lo)
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        # First call: the browser is attempted, fails, and the failure is
+        # cached (in-process and on disk).
+        source1 = write(tmp_path / "one.html", "<html></html>")
+        produced1 = convert.BrowserConverter().convert(source1, str(out_dir), [])
+        assert is_pdf(produced1)
+        assert len(run_calls) == 1
+        assert convert.browser_known_broken("/usr/bin/chromium") is True
+
+        # Second call, same process: must not re-attempt the browser at all.
+        source2 = write(tmp_path / "two.html", "<html></html>")
+        notes2 = []
+        produced2 = convert.BrowserConverter().convert(source2, str(out_dir), notes2)
+        assert is_pdf(produced2)
+        assert len(run_calls) == 1  # unchanged - the browser was not retried
+        assert len(lo_calls) == 2
+        assert any("skipped" in note.lower() or "libreoffice" in note.lower()
+                   for note in notes2)
+
+    def test_persistent_cache_survives_a_fresh_in_process_state(self, tmp_path, monkeypatch):
+        """The persistent on-disk cache (not just the in-process dict) must
+        also short-circuit the browser - this is what actually matters given
+        printer-ai is typically invoked once per print job."""
+        monkeypatch.setattr(convert, "find_browser", lambda: "/usr/bin/chromium")
+        monkeypatch.setattr(convert, "find_soffice", lambda: "/usr/bin/soffice")
+
+        convert._record_browser_status("/usr/bin/chromium", broken=True)
+        # Simulate a fresh process: the in-process mirror is empty, only the
+        # on-disk file carries the verdict.
+        convert._browser_status_cache.clear()
+
+        run_calls = []
+
+        def boom(cmd, timeout, what):  # pragma: no cover - must not be called
+            run_calls.append(cmd)
+            raise convert.ConversionError("should not run")
+
+        monkeypatch.setattr(convert, "_run_tool", boom)
+        monkeypatch.setattr(
+            convert.OfficeConverter, "convert_with_libreoffice",
+            lambda self, source, out_dir, notes: write(tmp_path / "out.pdf", "%PDF-1.4\n"),
+        )
+
+        source = write(tmp_path / "page.html", "<html></html>")
+        produced = convert.BrowserConverter().convert(source, str(tmp_path), [])
+        assert is_pdf(produced)
+        assert run_calls == []
+
+    def test_stale_cache_entry_is_reprobed(self, tmp_path, monkeypatch):
+        """A verdict older than BROWSER_STATUS_TTL must be re-checked, not
+        trusted forever - a browser can start working again."""
+        monkeypatch.setattr(convert, "find_browser", lambda: "/usr/bin/chromium")
+        convert._record_browser_status("/usr/bin/chromium", broken=True)
+        # Age both the in-process mirror AND the on-disk file - a stale
+        # verdict must be re-probed regardless of which one is consulted.
+        stale_entry = convert._browser_status_cache["/usr/bin/chromium"]
+        stale_entry["checked_at"] -= convert.BROWSER_STATUS_TTL + 1
+        on_disk = convert._load_browser_status()
+        on_disk["/usr/bin/chromium"]["checked_at"] -= convert.BROWSER_STATUS_TTL + 1
+        convert._save_browser_status(on_disk)
+        assert convert.browser_known_broken("/usr/bin/chromium") is False
 
 
 # ==================== Microsoft Office via COM ====================

@@ -552,3 +552,109 @@ def test_setup_without_error_still_returns_200(monkeypatch):
     assert result["code"] == 200
     assert result["msg"] == "success"
     assert result["data"] == payload
+
+
+# --------------------------------------------------------- remove / set_default: CUPS
+
+
+def _patch_cups_lpadmin(monkeypatch, run_result=None, calls=None):
+    """Route cn.remove/cn.set_default through the CUPS branch with lpadmin stubbed."""
+    import subprocess
+
+    monkeypatch.setattr(cn, "IS_WINDOWS", False)
+
+    def fake_run(cmd, *args, **kwargs):
+        if calls is not None:
+            calls.append(list(cmd))
+        return run_result or subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+
+def test_remove_cups_success(monkeypatch):
+    calls = []
+    _patch_cups_lpadmin(monkeypatch, calls=calls)
+
+    result = cn.remove("Office_Printer")
+
+    assert result["code"] == 200
+    assert result["data"]["removed"] == "Office_Printer"
+    assert calls == [["lpadmin", "-x", "Office_Printer"]]
+
+
+def test_set_default_cups_success(monkeypatch):
+    calls = []
+    _patch_cups_lpadmin(monkeypatch, calls=calls)
+
+    result = cn.set_default("Office_Printer")
+
+    assert result["code"] == 200
+    assert result["data"]["default"] == "Office_Printer"
+    assert calls == [["lpadmin", "-d", "Office_Printer"]]
+
+
+@pytest.mark.parametrize("bad_name", ["", "  ", "bad/name", "bad#name", "bad name", "a" * 221])
+def test_remove_cups_invalid_name_rejected_before_subprocess(monkeypatch, bad_name):
+    calls = []
+    _patch_cups_lpadmin(monkeypatch, calls=calls)
+
+    result = cn.remove(bad_name)
+
+    assert result["code"] == 400
+    assert "invalid printer name" in result["msg"]
+    assert calls == []
+
+
+@pytest.mark.parametrize("bad_name", ["", "bad/name", "bad#name", "bad name"])
+def test_set_default_cups_invalid_name_rejected_before_subprocess(monkeypatch, bad_name):
+    calls = []
+    _patch_cups_lpadmin(monkeypatch, calls=calls)
+
+    result = cn.set_default(bad_name)
+
+    assert result["code"] == 400
+    assert "invalid printer name" in result["msg"]
+    assert calls == []
+
+
+def test_remove_cups_missing_lpadmin_binary(monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr(cn, "IS_WINDOWS", False)
+
+    def fake_run(cmd, *args, **kwargs):
+        raise FileNotFoundError("lpadmin not found")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = cn.remove("Office_Printer")
+
+    assert result["code"] == 500
+    assert "lpadmin not found" in result["msg"]
+
+
+def test_set_default_cups_nonzero_exit_includes_stderr(monkeypatch):
+    import subprocess
+
+    failed = subprocess.CompletedProcess([], 1, stdout="", stderr="lpadmin: The printer or class does not exist.\n")
+    _patch_cups_lpadmin(monkeypatch, run_result=failed)
+
+    result = cn.set_default("NoSuchPrinter")
+
+    assert result["code"] == 500
+    assert "The printer or class does not exist" in result["msg"]
+
+
+def test_remove_cups_permission_denied_hints_privilege(monkeypatch):
+    import subprocess
+
+    failed = subprocess.CompletedProcess(
+        [], 1, stdout="", stderr="lpadmin: Not authorized to remove this printer.\n"
+    )
+    _patch_cups_lpadmin(monkeypatch, run_result=failed)
+
+    result = cn.remove("Office_Printer")
+
+    assert result["code"] == 500
+    assert "Not authorized" in result["msg"]
+    assert "root" in result["msg"] or "lpadmin group" in result["msg"]

@@ -38,6 +38,7 @@ Rules this module follows
 
 from __future__ import annotations
 
+import json
 import locale
 import os
 import shutil
@@ -45,6 +46,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -944,6 +946,13 @@ class ImageConverter(BaseConverter):
     extensions = tuple(sorted(IMAGE_EXTENSIONS))
     install_hint = PILLOW_HINT
 
+    #: Cap on frames placed from an animated GIF/WebP/APNG. Without a cap, a
+    #: many-thousand-frame animation becomes a many-thousand-page PDF - a
+    #: bounded partial result (with a note) is far more useful than either a
+    #: hard failure or an unbounded print job for what is usually an
+    #: animation, not a document.
+    MAX_IMAGE_FRAMES = 50
+
     def available(self) -> Tuple[bool, str]:
         try:
             import PIL
@@ -1008,8 +1017,12 @@ class ImageConverter(BaseConverter):
 
         pdf = rl_canvas.Canvas(target, pagesize=(width, height))
         frames = 0
+        truncated = False
         with image:
             for frame in ImageSequence.Iterator(image):
+                if frames >= self.MAX_IMAGE_FRAMES:
+                    truncated = True
+                    break
                 try:
                     prepared = ImageOps.exif_transpose(frame) or frame
                 except Exception:  # pragma: no cover - broken EXIF
@@ -1037,7 +1050,112 @@ class ImageConverter(BaseConverter):
             if frames > 1
             else f"image scaled to fit a {page_size_name()} page"
         )
+        if truncated:
+            notes.append(
+                f"the image had more than {self.MAX_IMAGE_FRAMES} frames; only "
+                f"the first {self.MAX_IMAGE_FRAMES} were printed, the rest were "
+                "dropped"
+            )
         return target
+
+
+# ==================== monospace font registration ====================
+
+#: Candidate TrueType monospace fonts, tried in order per platform. The
+#: base-14 Courier/Helvetica fonts reportlab ships have no glyphs outside
+#: Latin-1, so any Cyrillic/CJK/emoji character in a printed text/code/log
+#: file silently renders as a `.notdef` black box. When a real TTF with
+#: wider Unicode coverage can be found on this machine it is registered and
+#: used instead; Courier remains the fallback when none is found.
+MONOSPACE_FONT_LINUX_PATHS = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/google-noto-sans-mono-cjk-vf-fonts/NotoSansMonoCJK-VF.ttc",
+    "/usr/share/fonts/google-noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+)
+
+MONOSPACE_FONT_MAC_PATHS = (
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/Monaco.ttf",
+    "/Library/Fonts/Menlo.ttc",
+)
+
+MONOSPACE_FONT_WINDOWS_PATHS = (
+    r"C:\Windows\Fonts\consola.ttf",
+    r"C:\Windows\Fonts\cascadiamono.ttf",
+    r"C:\Windows\Fonts\lucon.ttf",
+)
+
+#: The reportlab font name a found TTF is registered under.
+REGISTERED_MONOSPACE_FONT_NAME = "PrinterAIMonospace"
+
+#: Sentinel distinguishing "registration not attempted yet in this process"
+#: from "attempted, and no suitable TTF was found" (both of which must not
+#: retry the filesystem probe or re-register on every conversion - reportlab
+#: raises if the same font name is registered twice, and probing several
+#: font paths on every print is wasted work once the answer is known).
+_MONOSPACE_FONT_UNSET = object()
+_monospace_font_cache: Any = _MONOSPACE_FONT_UNSET
+
+
+def _monospace_ttf_candidates() -> Tuple[str, ...]:
+    if _is_windows():
+        return MONOSPACE_FONT_WINDOWS_PATHS
+    if _is_macos():
+        return MONOSPACE_FONT_MAC_PATHS
+    return MONOSPACE_FONT_LINUX_PATHS
+
+
+def _find_monospace_ttf() -> Optional[str]:
+    """First candidate path that exists on disk, or None.
+
+    This only checks existence, not whether reportlab can actually load the
+    file (some formats, e.g. variable-font ``.ttc`` collections, exist but
+    fail to register) - :func:`registered_monospace_font` tries the next
+    candidate when registration fails, so a merely-existing-but-unusable
+    file does not make the whole feature give up.
+    """
+    for candidate in _monospace_ttf_candidates():
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def registered_monospace_font() -> Optional[str]:
+    """The reportlab font name to use for monospace text, or None.
+
+    Registers a TrueType font the first time this is called in the process
+    and caches the result (found-and-registered, or nothing found) so later
+    calls neither re-probe the filesystem nor re-register the font (which
+    reportlab rejects the second time). None means the caller should fall
+    back to the base-14 Courier font. Candidates are tried in order; one that
+    exists but fails to register (e.g. a variable-font ``.ttc`` reportlab
+    cannot parse) is skipped in favour of the next.
+    """
+    global _monospace_font_cache
+    if _monospace_font_cache is not _MONOSPACE_FONT_UNSET:
+        return _monospace_font_cache
+
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    font_name: Optional[str] = None
+    for candidate in _monospace_ttf_candidates():
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            pdfmetrics.registerFont(TTFont(REGISTERED_MONOSPACE_FONT_NAME, candidate))
+            font_name = REGISTERED_MONOSPACE_FONT_NAME
+            break
+        except Exception as exc:  # a malformed or unsupported (e.g. some
+            # .ttc) font file must fall back to the next candidate, not crash
+            # a print.
+            logger.debug("could not register monospace TTF %s: %s", candidate, exc)
+            continue
+    _monospace_font_cache = font_name
+    return font_name
 
 
 class TextConverter(BaseConverter):
@@ -1106,12 +1224,25 @@ class TextConverter(BaseConverter):
         return lines
 
     def render(self, text: str, target: str, title: str, notes: List[str]) -> str:
+        from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfgen import canvas as rl_canvas
+
+        body_font = registered_monospace_font()
+        if body_font is None:
+            body_font = self.FONT
+            notes.append(
+                "no TrueType monospace font was found on this machine - used the "
+                "built-in Courier font, which may not render non-Latin-1 "
+                "characters (Cyrillic, CJK, emoji, ...) correctly"
+            )
 
         width, height = page_size()
         usable_w = width - 2 * MARGIN
-        # Courier is exactly 0.6 em wide.
-        char_width = self.FONT_SIZE * 0.6
+        # Use the actual registered font's metrics for both the wrap width
+        # and the drawn text, so wrapping stays consistent with what is
+        # rendered - a wider font than Courier's fixed 0.6em would otherwise
+        # overflow the page if the column count still assumed Courier.
+        char_width = pdfmetrics.stringWidth("M", body_font, self.FONT_SIZE)
         columns = max(20, int(usable_w // char_width))
 
         header_gap = 20.0
@@ -1133,7 +1264,7 @@ class TextConverter(BaseConverter):
             pdf.drawString(MARGIN, height - MARGIN, title[:120])
             pdf.setLineWidth(0.4)
             pdf.line(MARGIN, height - MARGIN - 4, width - MARGIN, height - MARGIN - 4)
-            pdf.setFont(self.FONT, self.FONT_SIZE)
+            pdf.setFont(body_font, self.FONT_SIZE)
             y = top
             for line in chunk:
                 pdf.drawString(MARGIN, y, line)
@@ -1152,6 +1283,76 @@ class TextConverter(BaseConverter):
         text = self.read_text(source)
         return self.render(text, self._target(source, out_dir),
                            os.path.basename(source), notes)
+
+
+#: Where the "is the browser known broken" verdict is remembered across
+#: process runs. printer-ai is normally invoked once per print job (a fresh
+#: process each time from the CLI), so an in-process-only cache would help
+#: almost nothing in practice - this file is what actually saves the ~60s
+#: timeout on every subsequent call.
+BROWSER_STATUS_CACHE_PATH = os.path.join(
+    tempfile.gettempdir(), "printer-ai-browser-status.json"
+)
+
+#: How long a "broken" (or "working") verdict is trusted before the browser
+#: is probed again. An hour is long enough to avoid paying the timeout
+#: repeatedly in a batch of print jobs, short enough that a browser fixed by
+#: a package update or a display becoming available is noticed reasonably
+#: soon.
+BROWSER_STATUS_TTL = 3600.0
+
+#: In-process mirror of the on-disk verdict, so a single process that calls
+#: the browser converter many times only ever reads the file once.
+_browser_status_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _load_browser_status() -> Dict[str, Any]:
+    try:
+        with open(BROWSER_STATUS_CACHE_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError) as exc:
+        logger.debug("no usable browser status cache at %s: %s",
+                     BROWSER_STATUS_CACHE_PATH, exc)
+        return {}
+
+
+def _save_browser_status(data: Dict[str, Any]) -> None:
+    try:
+        with open(BROWSER_STATUS_CACHE_PATH, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+    except OSError as exc:  # best effort only - never let this block a print
+        logger.debug("could not write browser status cache: %s", exc)
+
+
+def browser_known_broken(browser: str) -> bool:
+    """True when ``browser`` failed/timed out recently enough to skip it.
+
+    Checks the in-process cache first, then falls back to the persistent
+    on-disk cache (shared across separate ``printer-ai`` invocations). A
+    verdict older than :data:`BROWSER_STATUS_TTL` is treated as stale so a
+    browser that has since started working again gets re-probed.
+    """
+    cached = _browser_status_cache.get(browser)
+    if cached is not None and (time.time() - cached["checked_at"]) < BROWSER_STATUS_TTL:
+        return bool(cached["broken"])
+
+    on_disk = _load_browser_status().get(browser)
+    if isinstance(on_disk, dict):
+        checked_at = on_disk.get("checked_at", 0)
+        if (time.time() - checked_at) < BROWSER_STATUS_TTL:
+            _browser_status_cache[browser] = on_disk
+            return bool(on_disk.get("broken"))
+    return False
+
+
+def _record_browser_status(browser: str, broken: bool) -> None:
+    """Remember whether ``browser`` just worked, in-process and on disk."""
+    entry = {"broken": broken, "checked_at": time.time()}
+    _browser_status_cache[browser] = entry
+    data = _load_browser_status()
+    data[browser] = entry
+    _save_browser_status(data)
 
 
 class BrowserConverter(BaseConverter):
@@ -1190,6 +1391,19 @@ class BrowserConverter(BaseConverter):
                 hint=BROWSER_HINT,
             )
 
+        if browser_known_broken(browser) and find_soffice():
+            # A previous call in this process (or a previous printer-ai
+            # invocation, within BROWSER_STATUS_TTL) already paid the full
+            # timeout finding out this browser cannot render headlessly here
+            # (e.g. no X11/Wayland session). Don't pay it again on every
+            # single file - go straight to the fallback.
+            notes.append(
+                f"{os.path.basename(browser)} was recently confirmed unable to "
+                "render headlessly here - skipped straight to LibreOffice, "
+                "which supports only basic HTML/CSS"
+            )
+            return OfficeConverter().convert_with_libreoffice(source, out_dir, notes)
+
         target = self._target(source, out_dir)
         # Chrome refuses to start against a profile another instance holds, so
         # every run gets a throwaway profile of its own.
@@ -1213,6 +1427,7 @@ class BrowserConverter(BaseConverter):
             # A browser that is installed but cannot run headless here (a
             # sandbox, a locked profile, a kiosk policy) must not make the
             # document unprintable when LibreOffice can still render it.
+            _record_browser_status(browser, broken=True)
             if not find_soffice():
                 raise
             logger.warning("browser rendering failed (%s); falling back to LibreOffice", exc)
@@ -1224,6 +1439,7 @@ class BrowserConverter(BaseConverter):
         finally:
             shutil.rmtree(profile, ignore_errors=True)
 
+        _record_browser_status(browser, broken=False)
         notes.append(f"rendered by {os.path.basename(browser)} (headless)")
         return target
 
@@ -1271,7 +1487,17 @@ class MarkdownConverter(BaseConverter):
         return False, html_detail
 
     def to_html(self, source: str) -> str:
-        """Render the Markdown file to a standalone HTML document."""
+        """Render the Markdown file to a standalone HTML document.
+
+        The document carries a ``<base href>`` pointing at the source file's
+        own directory, so relative asset references (``![x](img/photo.png)``)
+        resolve exactly as they would if the browser opened the Markdown
+        file's own folder - even though the HTML this generates is actually
+        written into a separate scratch directory before being handed to the
+        browser. It also carries an ``@page`` rule driven by this CLI's own
+        :func:`page_size`, so the printed layout uses the configured paper
+        size instead of the browser's default.
+        """
         import markdown as markdown_lib
 
         text = TextConverter.read_text(source)
@@ -1279,9 +1505,21 @@ class MarkdownConverter(BaseConverter):
             text, extensions=["fenced_code", "tables"]
         )
         title = _html_escape(os.path.basename(source))
+        source_dir = os.path.dirname(os.path.abspath(source))
+        base_url = _file_url(source_dir)
+        if not base_url.endswith("/"):
+            # _file_url() -> abspath() strips the trailing separator; put it
+            # back, since a <base href> without one resolves relative paths
+            # as siblings of the directory name, not inside it.
+            base_url += "/"
+        base_href = _html_escape(base_url)
+        width, height = page_size()
+        page_css = f"@page {{ size: {width:.3f}pt {height:.3f}pt; }}"
         return (
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-            f"<title>{title}</title><style>{self.CSS}</style></head>"
+            f"<base href=\"{base_href}\">"
+            f"<title>{title}</title><style>{page_css}</style>"
+            f"<style>{self.CSS}</style></head>"
             f"<body>{body}</body></html>"
         )
 

@@ -581,7 +581,7 @@ _IPV4_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
 # What a caller-supplied printer host may look like: a DNS/mDNS hostname made
 # of labels, or an IP literal (checked separately).  Mirrors the Windows setup
 # path's rule so `setup`/`probe` reject the same input on every platform.
-_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,253}$")
 
 
 def valid_host(host: Any) -> bool:

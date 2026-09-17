@@ -13,7 +13,6 @@ reported rather than hidden.
 """
 
 import ctypes
-import ipaddress
 import json
 import os
 import re
@@ -39,7 +38,6 @@ GENERIC_DRIVERS = {
 # Windows rejects these in a queue name, and the spooler caps it well below this.
 MAX_QUEUE_NAME = 220
 _FORBIDDEN_NAME_CHARS = ("\\", ",")
-_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 
 # Windows 11 and later; Add-PrinterPort cannot create an IPP port on these.
 WIN11_BUILD = 22000
@@ -88,18 +86,6 @@ def _ps_literal(value: Any) -> str:
     """
     text = "" if value is None else str(value)
     return "'" + text.replace("'", "''") + "'"
-
-
-def _valid_host(host: Any) -> bool:
-    """True if `host` is an IP address or a plausible hostname."""
-    if not isinstance(host, str) or not host:
-        return False
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        pass
-    return bool(_HOSTNAME_RE.match(host))
 
 
 def _name_error(value: Any, kind: str = "printer name") -> Optional[str]:
@@ -417,7 +403,7 @@ def add_port(name: str, host: Optional[str] = None, port_number: int = 9100) -> 
     if "://" in name:
         script = f"Add-PrinterPort -Name {_ps_literal(name)} -ErrorAction Stop"
     else:
-        if not _valid_host(host):
+        if not discovery.valid_host(host):
             return False, "invalid host"
         try:
             port_number = int(port_number)
@@ -570,7 +556,7 @@ def plan_setup(
     to the manufacturer's download portal, which a plan-only run must not do
     behind the user's back.
     """
-    if not _valid_host(host):
+    if not discovery.valid_host(host):
         return {"host": host, "reachable": False, "error": "invalid host"}
 
     identity = discovery.ipp_query(host, timeout=4.0)
@@ -623,7 +609,7 @@ def plan_setup(
         # Every scripted strategy left on Win11 is a downgrade; the UI pairing
         # path is the only one that yields a negotiating queue.
         result["recommended"] = (
-            f'scripts/win-pair-printer.ps1 -Match "{_pairing_regex(model, host)}"'
+            f"scripts/win-pair-printer.ps1 -Match {_ps_literal(_pairing_regex(model, host))}"
         )
         result["recommended_reason"] = (
             "pairs through Windows Settings and yields the full-featured "

@@ -175,6 +175,15 @@ class WindowsPrintOptions:
     # the same result on Windows instead of a silent no-op. Value maps are
     # keyed by the IPP value; a value with no entry is left in extra_options
     # (and reported as ignored) rather than guessed.
+    #: Upper bound for a translated ``copies`` value. A caller asking for more
+    #: than this almost certainly made a mistake (e.g. a fat-fingered JSON
+    #: value); rather than clamp it silently and surprise them with a
+    #: plausible-looking copy count, the value is left untranslated so it
+    #: shows up in ``extra_options``/``ignored_options`` instead. This also
+    #: protects local_printer.win_render.page_order from being asked to
+    #: materialise an unbounded page-index list.
+    MAX_COPIES = 999
+
     _CUPS_COPIES_KEYS = ("copies",)
     _CUPS_VALUE_MAPS = {
         # ipp key -> (dm field, {ipp value: dm value})
@@ -209,7 +218,9 @@ class WindowsPrintOptions:
                 copies = int(value)
             except (TypeError, ValueError):
                 return None
-            return ("dmCopies", copies) if copies >= 1 else None
+            if copies < 1 or copies > cls.MAX_COPIES:
+                return None
+            return ("dmCopies", copies)
         mapping = cls._CUPS_VALUE_MAPS.get(ipp_key)
         if mapping is None or isinstance(value, bool):
             return None

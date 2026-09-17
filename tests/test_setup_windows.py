@@ -51,38 +51,33 @@ def test_ps_literal_integration_nothing_expands():
     assert out == payload
 
 
-# ----------------------------------------------------------------- _valid_host
+# ----------------------------------------------------------------- host validation
 
 
-@pytest.mark.parametrize(
-    "host",
-    [
-        "192.168.1.5",
-        "10.0.0.1",
-        "::1",
-        "fe80::1",
-        "printer.local",
-        "MyPrinter",
-        "a-b.c",
-    ],
-)
-def test_valid_host_accepts(host):
-    assert sw._valid_host(host) is True
+def test_setup_windows_has_no_duplicate_hostname_validation():
+    # R4-08: host validation must live in one place (local_printer.discovery);
+    # setup_windows must not re-implement its own regex/helper for this.
+    assert not hasattr(sw, "_valid_host")
+    assert not hasattr(sw, "_HOSTNAME_RE")
 
 
-@pytest.mark.parametrize(
-    "host",
-    [
-        "x; rm -rf /",
-        "$(calc)",
-        "",
-        None,
-        123,
-        "a" * 254,
-    ],
-)
-def test_valid_host_rejects(host):
-    assert sw._valid_host(host) is False
+def test_setup_windows_delegates_host_validation_to_discovery(monkeypatch):
+    calls = []
+
+    def fake_valid_host(host):
+        calls.append(host)
+        return False
+
+    monkeypatch.setattr(sw.discovery, "valid_host", fake_valid_host)
+
+    result = sw.plan_setup("bogus-host")
+
+    assert calls == ["bogus-host"]
+    assert result == {
+        "host": "bogus-host",
+        "reachable": False,
+        "error": "invalid host",
+    }
 
 
 # ------------------------------------------------------------------ _name_error
@@ -392,6 +387,39 @@ def test_plan_setup_win11_recommends_pairing_script(monkeypatch):
     monkeypatch.setattr(sw, "is_windows_11", lambda: True)
     result = sw.plan_setup("192.168.1.5")
     assert "win-pair-printer.ps1" in result["recommended"]
+
+
+def test_plan_setup_recommended_command_escapes_malicious_model(monkeypatch):
+    # R4-10: `make_and_model` comes straight from the device over IPP -- an
+    # untrusted network source.  A model string carrying no recognisable word
+    # (so `_pairing_regex` falls back to the raw value) but a `"` and a
+    # backtick must not be interpolated into a bare double-quoted argument,
+    # where those characters could break out of the string or (with older
+    # PowerShell parsing quirks) be treated as interpolation/escape syntax.
+    malicious_model = '"`$(id)`"'
+    _patch_plan_common(monkeypatch, identity={"make_and_model": malicious_model})
+    monkeypatch.setattr(sw, "is_windows_11", lambda: True)
+
+    # Confirm the crafted value really does defeat _pairing_regex's word
+    # extraction and comes back to plan_setup verbatim -- otherwise this test
+    # would not be exercising the vulnerable path at all.
+    assert sw._pairing_regex(malicious_model, "192.168.1.5") == malicious_model
+
+    result = sw.plan_setup("192.168.1.5")
+    recommended = result["recommended"]
+
+    # The value must be routed through the same single-quoting helper used
+    # everywhere else, never dropped inside a raw double-quoted "...".
+    expected = f"scripts/win-pair-printer.ps1 -Match {sw._ps_literal(malicious_model)}"
+    assert recommended == expected
+
+    # It must be wrapped in a single-quoted PowerShell literal (exactly one
+    # opening and one closing unpaired quote), with no bare `-Match "` that a
+    # `"` in the payload could terminate early.
+    assert '-Match "' not in recommended
+    assert recommended.count("'") == 2
+    assert recommended.startswith("scripts/win-pair-printer.ps1 -Match '")
+    assert recommended.endswith("'")
 
 
 # ------------------------------------------------------------------------- _ps

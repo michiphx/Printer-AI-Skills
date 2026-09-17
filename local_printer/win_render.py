@@ -143,6 +143,16 @@ def fit_rect(
     return (x0, y0, x0 + width, y0 + height)
 
 
+# Hard ceiling on client-side copies, independent of anything the caller
+# translated upstream (models.model.WindowsPrintOptions.MAX_COPIES). A
+# dmCopies value can also arrive here via an explicit DEVMODE field that
+# never went through that translation, so this function clamps on its own
+# rather than trusting the caller - without it, a bogus copies value turns
+# into a Python list with page_count * copies entries, which is an easy
+# memory-exhaustion/hang bug reachable from a single bad --options value.
+MAX_CLIENT_COPIES = 999
+
+
 def page_order(page_count: int, copies: int, collate: bool):
     """Page indices to draw for client-side copies.
 
@@ -151,13 +161,20 @@ def page_order(page_count: int, copies: int, collate: bool):
 
     Args:
         page_count: Number of pages in the document.
-        copies: Number of copies to produce client-side (>= 1).
+        copies: Number of copies to produce client-side (>= 1). Clamped to
+            MAX_CLIENT_COPIES to bound the size of the returned list.
         collate: True for collated output.
 
     Returns:
         list[int]: zero-based page indices in draw order.
     """
     copies = max(1, int(copies or 1))
+    if copies > MAX_CLIENT_COPIES:
+        logger.warning(
+            f"[page_order] copies={copies} exceeds MAX_CLIENT_COPIES="
+            f"{MAX_CLIENT_COPIES}; clamping"
+        )
+        copies = MAX_CLIENT_COPIES
     if copies == 1:
         return list(range(page_count))
     if collate:

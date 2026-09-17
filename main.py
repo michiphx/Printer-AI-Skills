@@ -284,20 +284,42 @@ def cmd_print(args):
     send_path = args.file_path
     conversion = None
     if not args.raw:
-        # --keep-pdf leaves the PDF in its temporary directory instead of
-        # deleting it, so nothing is ever written next to the user's file.
+        # --keep-pdf reports the PDF's final path below, once it has been
+        # relocated out of the ephemeral directory to_pdf() creates here.
         try:
             conversion = convert_module.to_pdf(args.file_path)
         except convert_module.ConversionError as exc:
             finish(_conversion_failure(exc, args.file_path), True)
         send_path = conversion.pdf_path
 
+    kept_pdf_path = None
     try:
         result = backend.print_file(args.index, send_path, print_options, raw=args.raw)
     finally:
         # Both backends read the file synchronously before returning, so the
-        # temporary PDF can go as soon as print_file is done with it.
-        if conversion is not None and not args.keep_pdf:
+        # temporary PDF can be finalized as soon as print_file is done with it.
+        if conversion is not None:
+            if args.keep_pdf and conversion.temp:
+                # Move the kept PDF out of the ephemeral temp directory
+                # to_pdf() created into a stable, documented location, so
+                # that directory can always be removed by cleanup() below
+                # instead of leaking on disk forever.
+                import shutil
+                import uuid
+
+                kept_dir = os.path.expanduser("~/.cache/printer-ai/kept")
+                os.makedirs(kept_dir, exist_ok=True)
+                stem = os.path.splitext(os.path.basename(args.file_path))[0]
+                unique = uuid.uuid4().hex[:8]
+                kept_pdf_path = os.path.join(kept_dir, f"{stem}-{unique}.pdf")
+                shutil.move(conversion.pdf_path, kept_pdf_path)
+            elif args.keep_pdf:
+                # native: pdf_path is already the user's own file (not a
+                # temp dir), so there is nothing to relocate.
+                kept_pdf_path = conversion.pdf_path
+            # Always clean up the ephemeral temp directory, even when the
+            # PDF itself is being kept: the PDF has already been moved out
+            # of it above, so nothing of value is lost.
             convert_module.cleanup(conversion)
 
     if result.get("code") == 200 and conversion is not None:
@@ -309,7 +331,7 @@ def cmd_print(args):
         if conversion.notes:
             data["conversion_notes"] = list(conversion.notes)
         if args.keep_pdf:
-            data["pdf_path"] = conversion.pdf_path
+            data["pdf_path"] = kept_pdf_path
 
     if result.get("code") != 200:
         # Dump the whole result: it carries the reason and any hint

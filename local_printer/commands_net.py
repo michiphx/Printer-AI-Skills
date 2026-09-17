@@ -340,7 +340,7 @@ def driver_search(
 
 def remove(name: str) -> Dict[str, Any]:
     if not IS_WINDOWS:
-        return APIResponse.error(501, "remove is only implemented on Windows").to_dict()
+        return _remove_cups(name)
     ok, err = _setup.remove_printer(name)
     if not ok:
         return APIResponse.server_error(f"could not remove {name}: {err}").to_dict()
@@ -349,8 +349,80 @@ def remove(name: str) -> Dict[str, Any]:
 
 def set_default(name: str) -> Dict[str, Any]:
     if not IS_WINDOWS:
-        return APIResponse.error(501, "set-default is only implemented on Windows").to_dict()
+        return _set_default_cups(name)
     ok, err = _setup.set_default_printer(name)
     if not ok:
         return APIResponse.server_error(f"could not set default: {err}").to_dict()
+    return APIResponse.success({"default": name}).to_dict()
+
+
+# Mirrors setup_windows._name_error: reject an unusable queue name before it
+# ever reaches a subprocess argument list. CUPS forbids "/" and "#" in a queue
+# name and treats a leading space specially, so those join the same forbidden
+# set that already protects the Windows path against control characters.
+_CUPS_MAX_QUEUE_NAME = 220
+_CUPS_FORBIDDEN_NAME_CHARS = ("/", "#", " ", "\\", ",")
+
+
+def _cups_name_error(value: Any) -> Optional[str]:
+    """Return why `value` is unusable as a CUPS queue name, or None if it is."""
+    if not isinstance(value, str) or not value.strip():
+        return "invalid printer name: must be a non-empty string"
+    for bad in _CUPS_FORBIDDEN_NAME_CHARS:
+        if bad in value:
+            return f"invalid printer name: must not contain {bad!r} (CUPS forbids it)"
+    if len(value) > _CUPS_MAX_QUEUE_NAME:
+        return f"invalid printer name: longer than {_CUPS_MAX_QUEUE_NAME} characters"
+    return None
+
+
+def _run_lpadmin(args: List[str]) -> Dict[str, Any]:
+    """Run `lpadmin <args>`, returning an APIResponse-shaped dict on failure.
+
+    Mirrors the subprocess handling in `_setup_cups`: an argument list (never
+    `shell=True`), a missing binary and a non-zero exit both surfaced as clear
+    errors, and a permission-denied exit hinting at the privilege it needs.
+    """
+    import subprocess
+
+    cmd = ["lpadmin"] + args
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        return APIResponse.server_error(
+            "lpadmin not found - is CUPS installed on this machine?"
+        ).to_dict()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return APIResponse.server_error(f"lpadmin failed: {exc}").to_dict()
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        msg = f"lpadmin failed: {stderr}" if stderr else "lpadmin failed"
+        if "not authorized" in stderr.lower() or "permission" in stderr.lower():
+            msg += " (this usually needs to run as root or a member of the lpadmin group)"
+        return APIResponse.server_error(msg).to_dict()
+    return {}
+
+
+def _remove_cups(name: str) -> Dict[str, Any]:
+    """CUPS equivalent of the Windows remove: `lpadmin -x <name>`."""
+    problem = _cups_name_error(name)
+    if problem:
+        return APIResponse.error(400, problem).to_dict()
+
+    failure = _run_lpadmin(["-x", name])
+    if failure:
+        return failure
+    return APIResponse.success({"removed": name}).to_dict()
+
+
+def _set_default_cups(name: str) -> Dict[str, Any]:
+    """CUPS equivalent of the Windows set-default: `lpadmin -d <name>`."""
+    problem = _cups_name_error(name)
+    if problem:
+        return APIResponse.error(400, problem).to_dict()
+
+    failure = _run_lpadmin(["-d", name])
+    if failure:
+        return failure
     return APIResponse.success({"default": name}).to_dict()

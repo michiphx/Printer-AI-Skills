@@ -415,6 +415,16 @@ def test_page_order_uncollated_repeats_each_page():
     assert win_render.page_order(3, 2, collate=False) == [0, 0, 1, 1, 2, 2]
 
 
+def test_page_order_clamps_absurd_copies_instead_of_allocating_huge_list():
+    """A huge copies value (e.g. from a DEVMODE field that never went through
+    WindowsPrintOptions._translate_cups_key's own bound) must not make this
+    function try to build a page_count * copies list - that is the
+    resource-exhaustion bug this guards against."""
+    result = win_render.page_order(500, 999999999, collate=True)
+    assert len(result) == 500 * win_render.MAX_CLIENT_COPIES
+    assert len(result) < 10_000_000  # sane upper bound, nowhere near unbounded
+
+
 # -------------------------------------------------------------- the GDI path
 
 
