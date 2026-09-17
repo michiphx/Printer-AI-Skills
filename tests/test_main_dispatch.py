@@ -208,6 +208,46 @@ def run_cli(argv, expect_code=0):
     return args
 
 
+class TestPruneKeptPdfs:
+    """Unit tests for main._prune_kept_pdfs (R5-05), independent of the full
+    print path - it just needs a directory of files with controllable mtimes."""
+
+    def test_old_files_removed_recent_files_kept(self, tmp_path):
+        old = tmp_path / "old.pdf"
+        recent = tmp_path / "recent.pdf"
+        old.write_text("old")
+        recent.write_text("recent")
+
+        now = 1_000_000.0
+        eight_days_ago = now - 8 * 86400
+        one_day_ago = now - 86400
+        os.utime(old, (eight_days_ago, eight_days_ago))
+        os.utime(recent, (one_day_ago, one_day_ago))
+
+        main._prune_kept_pdfs(str(tmp_path), max_age_days=7, now=now)
+
+        assert not old.exists()
+        assert recent.exists()
+
+    def test_missing_directory_does_not_raise(self, tmp_path):
+        main._prune_kept_pdfs(str(tmp_path / "does-not-exist"))
+
+    def test_removal_error_does_not_propagate(self, tmp_path, monkeypatch):
+        stale = tmp_path / "stale.pdf"
+        stale.write_text("stale")
+        old_time = 0.0
+        os.utime(stale, (old_time, old_time))
+
+        def boom(path):
+            raise PermissionError("nope")
+
+        monkeypatch.setattr(os, "remove", boom)
+
+        # Must not raise even though the removal itself fails.
+        main._prune_kept_pdfs(str(tmp_path), max_age_days=7, now=1_000_000.0)
+        assert stale.exists()
+
+
 class TestCmdPrint:
     def test_text_file_is_converted_before_the_backend_sees_it(
         self, fake_backend, tmp_path, capsys

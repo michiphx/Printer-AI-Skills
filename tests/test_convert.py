@@ -12,6 +12,7 @@ Three groups live here:
   them can run on this machine.
 """
 
+import json
 import os
 import shutil
 import sys
@@ -95,11 +96,15 @@ def isolated_monospace_font_cache(monkeypatch):
 def isolated_browser_status_cache(tmp_path, monkeypatch):
     """Keep the persistent "is the browser broken" cache out of the real
     machine state and out of other tests: each test gets an empty in-process
-    cache and its own throwaway cache file."""
+    cache and its own throwaway cache directory."""
+    cache_dir = tmp_path / "printer-ai-cache"
+
+    def fake_cache_dir():
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return str(cache_dir)
+
     monkeypatch.setattr(convert, "_browser_status_cache", {})
-    monkeypatch.setattr(
-        convert, "BROWSER_STATUS_CACHE_PATH", str(tmp_path / "browser-status.json")
-    )
+    monkeypatch.setattr(convert, "printer_ai_cache_dir", fake_cache_dir)
 
 
 # ==================== format detection ====================
@@ -383,6 +388,35 @@ class TestTextConversion:
         )
         font_name = convert.registered_monospace_font()
         assert font_name == convert.REGISTERED_MONOSPACE_FONT_NAME
+
+    def test_cjk_text_gets_a_coverage_note(self, tmp_path):
+        """R5-03: on this machine the only registered monospace TTF has no
+        CJK glyphs at all, so CJK text must be flagged - a "a real font was
+        registered" check alone would miss this."""
+        source = write(tmp_path / "cjk.txt", "some notes\n中文测试\nmore notes\n")
+        result = convert.to_pdf(source, out_dir=str(tmp_path / "out"))
+        assert is_pdf(result.pdf_path)
+        font_name = convert.registered_monospace_font()
+        if font_name is None:
+            pytest.skip("no TTF registered on this machine - covered by the "
+                        "generic Courier-fallback note instead")
+        assert any(
+            "chinese" in note.lower() or "japanese" in note.lower()
+            or "korean" in note.lower() or "cjk" in note.lower()
+            for note in result.notes
+        ), result.notes
+
+    def test_latin_and_cyrillic_text_gets_no_cjk_note(self, tmp_path):
+        """Cyrillic IS covered by the registered font on this machine, so no
+        CJK warning should be added for text that never uses a CJK range."""
+        source = write(tmp_path / "cyrillic.txt", "hello world\nПривет мир\n")
+        result = convert.to_pdf(source, out_dir=str(tmp_path / "out"))
+        assert is_pdf(result.pdf_path)
+        assert not any(
+            "chinese" in note.lower() or "japanese" in note.lower()
+            or "korean" in note.lower() or "cjk" in note.lower()
+            for note in result.notes
+        ), result.notes
 
 
 # ==================== live: image -> PDF ====================
@@ -895,6 +929,47 @@ class TestBrowserDiscovery:
         on_disk["/usr/bin/chromium"]["checked_at"] -= convert.BROWSER_STATUS_TTL + 1
         convert._save_browser_status(on_disk)
         assert convert.browser_known_broken("/usr/bin/chromium") is False
+
+    def test_cache_lives_under_home_cache_dir_not_system_temp(self, tmp_path):
+        """R5-01: the cache file must sit under ~/.cache/printer-ai, not the
+        shared, world-writable system temp directory."""
+        convert._record_browser_status("/usr/bin/chromium", broken=True)
+        cache_dir = convert.printer_ai_cache_dir()
+        assert cache_dir == str(tmp_path / "printer-ai-cache")
+        assert os.path.isfile(os.path.join(cache_dir, "browser-status.json"))
+
+    def test_save_does_not_follow_a_symlink_at_the_target_path(self, tmp_path):
+        """R5-01: a symlink planted at the cache path must not be written
+        through - the file it points at must be left untouched."""
+        cache_dir = convert.printer_ai_cache_dir()
+        target_path = os.path.join(cache_dir, "browser-status.json")
+        victim = tmp_path / "victim.json"
+        victim.write_text('{"do not touch": true}')
+        os.symlink(str(victim), target_path)
+
+        convert._save_browser_status({"chrome": {"broken": True, "checked_at": 1.0}})
+
+        # The symlink itself must be gone (replaced by a real file via
+        # os.replace), and the file it used to point at must be untouched.
+        assert victim.read_text() == '{"do not touch": true}'
+        assert not os.path.islink(target_path)
+        with open(target_path, encoding="utf-8") as handle:
+            assert json.load(handle) == {"chrome": {"broken": True, "checked_at": 1.0}}
+
+    def test_concurrent_saves_never_leave_a_corrupt_file(self, tmp_path):
+        """R5-02: simulate two "concurrent" writers with no locking - the
+        rename-based swap must mean the file is always valid JSON, never a
+        partial/interleaved write."""
+        convert._save_browser_status({"a": {"broken": True, "checked_at": 1.0}})
+        convert._save_browser_status({"b": {"broken": False, "checked_at": 2.0}})
+
+        cache_dir = convert.printer_ai_cache_dir()
+        target_path = os.path.join(cache_dir, "browser-status.json")
+        with open(target_path, encoding="utf-8") as handle:
+            data = json.load(handle)  # would raise on interleaved/partial content
+        assert data == {"b": {"broken": False, "checked_at": 2.0}}
+        # No leftover temp files from either write.
+        assert [n for n in os.listdir(cache_dir) if n.endswith(".tmp")] == []
 
 
 # ==================== Microsoft Office via COM ====================

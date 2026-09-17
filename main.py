@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from sys import platform
 
 # The platform backends are imported lazily by _backend(). Importing them at
@@ -242,6 +243,39 @@ def _build_print_options(options_dict, options_class):
         return None, {"code": 400, "msg": f"invalid print options: {e}", "data": {}}
 
 
+#: How long a `--keep-pdf` output is kept before `_prune_kept_pdfs` removes
+#: it. Age-based rather than a count cap: a single mtime pass needs no
+#: sorting, and it matches what "kept" is actually for here - reviewing a
+#: recent print, not permanent archival - so a week is generous without
+#: letting the directory grow forever.
+KEPT_PDF_MAX_AGE_DAYS = 7
+
+
+def _prune_kept_pdfs(kept_dir, max_age_days=KEPT_PDF_MAX_AGE_DAYS, now=None):
+    """Delete files in `kept_dir` older than `max_age_days`, best effort.
+
+    Called right before a new kept PDF is written, so the directory never
+    accumulates print after print with nothing ever cleaning it up. Never
+    raises: a listing error, a file vanishing between listing and removal,
+    or a permission error deleting one must not fail the print job that
+    triggered the prune - at worst that one file survives to the next call.
+    """
+    try:
+        names = os.listdir(kept_dir)
+    except OSError:
+        return
+    cutoff = (now if now is not None else time.time()) - max_age_days * 86400
+    for name in names:
+        path = os.path.join(kept_dir, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            # Already gone, or no permission to remove it - leave it for
+            # next time rather than letting this block the current print.
+            continue
+
+
 def cmd_print(args):
     """Print a file, converting it to PDF first unless --raw was given.
 
@@ -309,6 +343,7 @@ def cmd_print(args):
 
                 kept_dir = os.path.expanduser("~/.cache/printer-ai/kept")
                 os.makedirs(kept_dir, exist_ok=True)
+                _prune_kept_pdfs(kept_dir)
                 stem = os.path.splitext(os.path.basename(args.file_path))[0]
                 unique = uuid.uuid4().hex[:8]
                 kept_pdf_path = os.path.join(kept_dir, f"{stem}-{unique}.pdf")

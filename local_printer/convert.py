@@ -47,6 +47,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -1098,6 +1099,11 @@ REGISTERED_MONOSPACE_FONT_NAME = "PrinterAIMonospace"
 #: font paths on every print is wasted work once the answer is known).
 _MONOSPACE_FONT_UNSET = object()
 _monospace_font_cache: Any = _MONOSPACE_FONT_UNSET
+#: The on-disk path of whichever TTF got registered as _monospace_font_cache
+#: (None when nothing was found, i.e. the caller fell back to Courier) - kept
+#: alongside the font name so a glyph-coverage check can be done against the
+#: actual file, not just its reportlab-registered name.
+_monospace_font_path_cache: Optional[str] = None
 
 
 def _monospace_ttf_candidates() -> Tuple[str, ...]:
@@ -1134,7 +1140,7 @@ def registered_monospace_font() -> Optional[str]:
     exists but fails to register (e.g. a variable-font ``.ttc`` reportlab
     cannot parse) is skipped in favour of the next.
     """
-    global _monospace_font_cache
+    global _monospace_font_cache, _monospace_font_path_cache
     if _monospace_font_cache is not _MONOSPACE_FONT_UNSET:
         return _monospace_font_cache
 
@@ -1142,12 +1148,14 @@ def registered_monospace_font() -> Optional[str]:
     from reportlab.pdfbase.ttfonts import TTFont
 
     font_name: Optional[str] = None
+    font_path: Optional[str] = None
     for candidate in _monospace_ttf_candidates():
         if not os.path.isfile(candidate):
             continue
         try:
             pdfmetrics.registerFont(TTFont(REGISTERED_MONOSPACE_FONT_NAME, candidate))
             font_name = REGISTERED_MONOSPACE_FONT_NAME
+            font_path = candidate
             break
         except Exception as exc:  # a malformed or unsupported (e.g. some
             # .ttc) font file must fall back to the next candidate, not crash
@@ -1155,7 +1163,89 @@ def registered_monospace_font() -> Optional[str]:
             logger.debug("could not register monospace TTF %s: %s", candidate, exc)
             continue
     _monospace_font_cache = font_name
+    _monospace_font_path_cache = font_path
     return font_name
+
+
+def registered_monospace_font_path() -> Optional[str]:
+    """The on-disk path of the TTF :func:`registered_monospace_font` picked.
+
+    None both when no TTF was found (Courier fallback) and before
+    :func:`registered_monospace_font` has been called - callers that need
+    this always call the latter first, which is the case here.
+    """
+    return _monospace_font_path_cache
+
+
+# ==================== CJK glyph-coverage check ====================
+
+#: Unicode ranges covering the CJK scripts most likely to show up in text
+#: someone prints: Hiragana/Katakana, Hangul, and the common CJK Unified
+#: Ideographs blocks (plus their halfwidth/fullwidth and compatibility
+#: variants). Not exhaustive - this backs a best-effort warning, not a
+#: certification that every possible CJK codepoint was checked.
+CJK_UNICODE_RANGES: Tuple[Tuple[int, int], ...] = (
+    (0x3040, 0x30FF),   # Hiragana, Katakana
+    (0x3400, 0x4DBF),   # CJK Unified Ideographs Extension A
+    (0x4E00, 0x9FFF),   # CJK Unified Ideographs
+    (0xAC00, 0xD7A3),   # Hangul Syllables
+    (0xF900, 0xFAFF),   # CJK Compatibility Ideographs
+    (0xFF00, 0xFFEF),   # Halfwidth and Fullwidth Forms
+)
+
+
+def _cjk_codepoints(text: str) -> set:
+    """Distinct codepoints in ``text`` that fall in a CJK Unicode range."""
+    return {
+        ord(ch) for ch in text
+        if any(lo <= ord(ch) <= hi for lo, hi in CJK_UNICODE_RANGES)
+    }
+
+
+def _font_cmap(font_path: Optional[str]) -> Optional[Dict[int, str]]:
+    """Best-effort {codepoint: glyph name} map for ``font_path``.
+
+    None when it cannot be determined at all (no path - i.e. the Courier
+    fallback - fontTools missing, or the file cannot be parsed); callers
+    must then assume the worst rather than silently skip the warning.
+    """
+    if not font_path:
+        return None
+    try:
+        from fontTools.ttLib import TTFont as FontToolsTTFont
+
+        return FontToolsTTFont(font_path, fontNumber=0).getBestCmap()
+    except Exception as exc:
+        logger.debug("could not read glyph coverage for %s: %s", font_path, exc)
+        return None
+
+
+def _cjk_coverage_note(text: str, font_path: Optional[str]) -> Optional[str]:
+    """A conversion note when ``text`` has CJK characters the chosen font
+    cannot render, or None when there is nothing to warn about.
+
+    This exists because a "real" TrueType font being registered
+    successfully (see :func:`registered_monospace_font`) does not mean it
+    covers CJK: on this machine the only usable monospace TTF
+    (NotoSansMono-Regular.ttf) has zero CJK glyphs, while the CJK font that
+    *is* installed (NotoSansMonoCJK-VF.ttc) cannot be loaded by reportlab at
+    all (PostScript/CFF outlines in a .ttc container - unsupported, not
+    worth chasing). Without this check such a document would silently print
+    `.notdef` tofu boxes. The scan runs once per document, not per
+    character/render call, and never fails the conversion - it only adds an
+    informational note.
+    """
+    codepoints = _cjk_codepoints(text)
+    if not codepoints:
+        return None
+    cmap = _font_cmap(font_path)
+    uncovered = True if cmap is None else any(cp not in cmap for cp in codepoints)
+    if not uncovered:
+        return None
+    return (
+        "some Chinese/Japanese/Korean characters may not render: no available "
+        "font covers them on this machine"
+    )
 
 
 class TextConverter(BaseConverter):
@@ -1228,6 +1318,7 @@ class TextConverter(BaseConverter):
         from reportlab.pdfgen import canvas as rl_canvas
 
         body_font = registered_monospace_font()
+        font_path = registered_monospace_font_path()
         if body_font is None:
             body_font = self.FONT
             notes.append(
@@ -1235,6 +1326,13 @@ class TextConverter(BaseConverter):
                 "built-in Courier font, which may not render non-Latin-1 "
                 "characters (Cyrillic, CJK, emoji, ...) correctly"
             )
+        else:
+            # A registered TTF is not proof it covers everything: it may
+            # still lack CJK glyphs (see _cjk_coverage_note), which a plain
+            # "a real font was found" check would miss entirely.
+            cjk_note = _cjk_coverage_note(text, font_path)
+            if cjk_note:
+                notes.append(cjk_note)
 
         width, height = page_size()
         usable_w = width - 2 * MARGIN
@@ -1285,14 +1383,27 @@ class TextConverter(BaseConverter):
                            os.path.basename(source), notes)
 
 
+def printer_ai_cache_dir() -> str:
+    """The per-user cache directory this CLI keeps its own state under.
+
+    ``~/.cache/printer-ai`` (also used for ``--keep-pdf`` output, see
+    ``main.py``) rather than the shared, world-writable system temp
+    directory: a fixed, predictable path under ``/tmp`` can be pre-created
+    by another user as a symlink to something the caller does not intend to
+    overwrite, which a per-user home directory is not exposed to.
+    """
+    cache_dir = os.path.expanduser(os.path.join("~", ".cache", "printer-ai"))
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
 #: Where the "is the browser known broken" verdict is remembered across
 #: process runs. printer-ai is normally invoked once per print job (a fresh
 #: process each time from the CLI), so an in-process-only cache would help
 #: almost nothing in practice - this file is what actually saves the ~60s
 #: timeout on every subsequent call.
-BROWSER_STATUS_CACHE_PATH = os.path.join(
-    tempfile.gettempdir(), "printer-ai-browser-status.json"
-)
+def _browser_status_cache_path() -> str:
+    return os.path.join(printer_ai_cache_dir(), "browser-status.json")
 
 #: How long a "broken" (or "working") verdict is trusted before the browser
 #: is probed again. An hour is long enough to avoid paying the timeout
@@ -1307,22 +1418,49 @@ _browser_status_cache: Dict[str, Dict[str, Any]] = {}
 
 
 def _load_browser_status() -> Dict[str, Any]:
+    path = _browser_status_cache_path()
     try:
-        with open(BROWSER_STATUS_CACHE_PATH, "r", encoding="utf-8") as handle:
+        with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError) as exc:
-        logger.debug("no usable browser status cache at %s: %s",
-                     BROWSER_STATUS_CACHE_PATH, exc)
+        logger.debug("no usable browser status cache at %s: %s", path, exc)
         return {}
 
 
 def _save_browser_status(data: Dict[str, Any]) -> None:
+    """Write the browser status cache atomically and safely.
+
+    Two safety properties matter for a file that lives at a path other
+    processes/users could pre-create:
+
+    - No symlink following: the final write target is opened with
+      ``O_NOFOLLOW`` so a symlink planted at that path is never written
+      through to whatever it points at.
+    - Atomicity: the new content is written to a uniquely-named temp file in
+      the same directory first, then swapped into place with
+      ``os.replace``, which is atomic on POSIX and Windows. Without this, two
+      ``printer-ai`` processes updating the cache at the same time could
+      interleave their writes and leave the file half-written/unparseable.
+    """
+    path = _browser_status_cache_path()
+    directory = os.path.dirname(path) or "."
+    tmp_path = os.path.join(directory, f".browser-status.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
-        with open(BROWSER_STATUS_CACHE_PATH, "w", encoding="utf-8") as handle:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle)
+        # The temp file has a unique, unpredictable name, so no other process
+        # could have pre-created a symlink at that exact path; the rename
+        # itself replaces whatever (if anything) sits at the final path
+        # without ever opening/following it.
+        os.replace(tmp_path, path)
     except OSError as exc:  # best effort only - never let this block a print
         logger.debug("could not write browser status cache: %s", exc)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 def browser_known_broken(browser: str) -> bool:

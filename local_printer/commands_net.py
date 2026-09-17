@@ -248,19 +248,51 @@ def _setup_cups(host: str, name: Optional[str] = None, dry_run: bool = False) ->
         return APIResponse.error(400, "invalid host").to_dict()
 
     identity = discovery.ipp_query(host, timeout=4.0)
-    if not identity:
+    if identity:
+        queue = name or (identity.get("make_and_model") or f"printer-{host}")
+        queue = "".join(c if c.isalnum() or c in "-_" else "_" for c in queue)
+        uri = identity["ipp_uri"]
+        cmd = ["lpadmin", "-p", queue, "-E", "-v", uri, "-m", "everywhere"]
+
+        if dry_run:
+            return APIResponse.success({
+                "host": host, "identity": identity, "would_run": shlex.join(cmd)
+            }).to_dict()
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return APIResponse.server_error(f"lpadmin failed: {exc}").to_dict()
+
+        if proc.returncode != 0:
+            return APIResponse.server_error(
+                f"lpadmin failed: {proc.stderr.strip()}", {"command": shlex.join(cmd)}
+            ).to_dict()
+        return APIResponse.success({
+            "printer": queue, "host": host, "uri": uri, "identity": identity,
+            "installed_with": {"kind": "ipp-everywhere", "driver": "everywhere"},
+        }).to_dict()
+
+    # No IPP answer at all: mirror the Windows ladder's last resort (see
+    # setup_windows.plan_setup's "raw-fallback" rung) instead of giving up
+    # immediately - a device with IPP disabled/unsupported but a plain
+    # JetDirect/AppSocket port open can still be printed to, just without
+    # driverless capability negotiation.
+    open_ports = discovery.probe_ports(host, ports=[9100], timeout=4.0)
+    if not open_ports.get(9100):
         return APIResponse.error(
             404, f"{host} does not answer IPP - cannot set up driverless printing"
         ).to_dict()
 
-    queue = name or (identity.get("make_and_model") or f"printer-{host}")
+    queue = name or f"printer-{host}"
     queue = "".join(c if c.isalnum() or c in "-_" else "_" for c in queue)
-    uri = identity["ipp_uri"]
-    cmd = ["lpadmin", "-p", queue, "-E", "-v", uri, "-m", "everywhere"]
+    uri = f"socket://{host}:9100"
+    cmd = ["lpadmin", "-p", queue, "-E", "-v", uri, "-m", "raw"]
 
     if dry_run:
         return APIResponse.success({
-            "host": host, "identity": identity, "would_run": shlex.join(cmd)
+            "host": host, "identity": None, "would_run": shlex.join(cmd),
+            "raw_fallback": True,
         }).to_dict()
 
     try:
@@ -273,8 +305,14 @@ def _setup_cups(host: str, name: Optional[str] = None, dry_run: bool = False) ->
             f"lpadmin failed: {proc.stderr.strip()}", {"command": shlex.join(cmd)}
         ).to_dict()
     return APIResponse.success({
-        "printer": queue, "host": host, "uri": uri, "identity": identity,
-        "installed_with": {"kind": "ipp-everywhere", "driver": "everywhere"},
+        "printer": queue, "host": host, "uri": uri, "identity": None,
+        "raw_fallback": True,
+        "installed_with": {"kind": "raw-fallback", "driver": "raw"},
+        "note": (
+            f"{host} did not answer IPP; installed a generic raw/9100 queue "
+            "instead - no driverless capability negotiation (duplex, media "
+            "size, colour, ...), just a plain print stream"
+        ),
     }).to_dict()
 
 

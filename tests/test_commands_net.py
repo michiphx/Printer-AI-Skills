@@ -388,14 +388,36 @@ def _patch_cups_setup(monkeypatch, identity, run_result=None, calls=None):
 
 
 def test_setup_cups_host_without_ipp_is_404(monkeypatch):
+    """R5-04: when both IPP and the raw-9100 fallback fail to answer, the
+    original 404 behaviour must be unchanged."""
     calls = []
     _patch_cups_setup(monkeypatch, identity=None, calls=calls)
+    monkeypatch.setattr(discovery, "probe_ports", lambda host, ports=None, timeout=1.0: {9100: False})
 
     result = cn.setup("10.0.0.5")
 
     assert result["code"] == 404
     assert "does not answer IPP" in result["msg"]
     assert calls == []
+
+
+def test_setup_cups_falls_back_to_raw_9100_when_ipp_does_not_answer(monkeypatch):
+    """R5-04: an IPP-less device with a raw/JetDirect port open must still
+    get a working (if degraded) queue, mirroring the Windows ladder's
+    raw-fallback rung instead of giving up outright."""
+    calls = []
+    _patch_cups_setup(monkeypatch, identity=None, calls=calls)
+    monkeypatch.setattr(discovery, "probe_ports", lambda host, ports=None, timeout=1.0: {9100: True})
+
+    result = cn.setup("10.0.0.5")
+
+    assert result["code"] == 200
+    assert result["data"]["installed_with"] == {"kind": "raw-fallback", "driver": "raw"}
+    assert result["data"]["raw_fallback"] is True
+    assert calls == [[
+        "lpadmin", "-p", "printer-10_0_0_5", "-E", "-v", "socket://10.0.0.5:9100",
+        "-m", "raw",
+    ]]
 
 
 @pytest.mark.parametrize("host", ["x; rm", "host&&id", "ipp://printer.local", ""])
